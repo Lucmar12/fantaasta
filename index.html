@@ -1229,6 +1229,7 @@ function AstaFantacalcio() {
             ["quick", "Vista rapida"],
             ["listone", `Listone${playerDB.length ? ` (${playerDB.length})` : ""}`],
             ["log", "Registro"],
+            ["draw", "Sorteggio"],
             ["setup", "Impostazioni"],
           ].map(([key, label]) => (
             <button
@@ -1274,6 +1275,17 @@ function AstaFantacalcio() {
           addManualPlayer={addManualPlayer}
           editManualPlayer={editManualPlayer}
           deleteManualPlayer={deleteManualPlayer}
+        />
+      )}
+
+      {view === "draw" && (
+        <DrawView
+          playerDB={playerDB}
+          soldMap={soldMap}
+          teams={teams}
+          teamStats={teamStats}
+          settings={settings}
+          addPlayer={addPlayer}
         />
       )}
 
@@ -2180,6 +2192,163 @@ function QuickCallModal({ teams, settings, teamStats, playerDB, soldMap, addPlay
           Registra
         </button>
       </div>
+    </div>
+  );
+}
+
+function DrawView({ playerDB, soldMap, teams, teamStats, settings, addPlayer }) {
+  const [roleFilter, setRoleFilter] = useState("ALL");
+  const [drawn, setDrawn] = useState(null);
+  const [teamId, setTeamId] = useState(0);
+  const [price, setPrice] = useState("");
+
+  const inputStyle = {
+    background: "rgba(243,239,228,0.07)",
+    color: CREAM,
+    border: "1px solid rgba(243,239,228,0.14)",
+  };
+
+  const pool = useMemo(() => {
+    return playerDB.filter(
+      (p) => (roleFilter === "ALL" || p.role === roleFilter) && !soldMap.has(`${p.name.toLowerCase()}|${p.role}`)
+    );
+  }, [playerDB, soldMap, roleFilter]);
+
+  const draw = () => {
+    if (!pool.length) return;
+    const pick = pool[Math.floor(Math.random() * pool.length)];
+    setDrawn(pick);
+    setPrice(pick.price != null ? String(pick.price) : "");
+  };
+
+  const assign = () => {
+    if (!drawn) return;
+    const ok = addPlayer({ name: drawn.name, role: drawn.role, teamId, price });
+    if (ok) {
+      setDrawn(null);
+      setPrice("");
+    }
+  };
+
+  return (
+    <div className="px-3 mt-1 flex flex-col gap-3 pb-10">
+      <div className="rounded-xl p-3" style={{ background: CARD_BG }}>
+        <div className="font-semibold mb-1" style={{ color: CREAM, fontFamily: DISPLAY_FONT }}>
+          Sorteggio giocatore
+        </div>
+        <div className="text-[11px] mb-3" style={{ color: "rgba(243,239,228,0.5)" }}>
+          Riserva per quando l'app ufficiale dell'asta non funziona: estrai un giocatore a caso tra quelli ancora
+          liberi nel listone e assegnalo a una squadra.
+        </div>
+
+        <div className="relative mb-3">
+          <div className="flex gap-1.5 overflow-x-auto">
+            {[["ALL", "Tutti"], ...ROLES.map((r) => [r.key, r.label])].map(([key, label]) => (
+              <button
+                key={key}
+                onClick={() => {
+                  setRoleFilter(key);
+                  setDrawn(null);
+                }}
+                className="text-xs font-semibold px-2.5 py-1.5 rounded-lg whitespace-nowrap"
+                style={{
+                  background: roleFilter === key ? (key === "ALL" ? GOLD : roleColor(key)) : "rgba(243,239,228,0.08)",
+                  color: roleFilter === key ? BG : CREAM,
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div
+            className="pointer-events-none absolute top-0 right-0 h-full w-8"
+            style={{ background: `linear-gradient(to right, transparent, ${CARD_BG})` }}
+          />
+        </div>
+
+        <div className="text-[11px] mb-2" style={{ color: "rgba(243,239,228,0.45)" }}>
+          {pool.length} giocatori liberi per questo filtro
+        </div>
+
+        {drawn ? (
+          <div
+            className="rounded-lg p-4 mb-3 text-center"
+            style={{ background: "rgba(212,160,23,0.12)", border: `1px solid ${GOLD}` }}
+          >
+            <div className="text-xs font-semibold mb-1" style={{ color: roleColor(drawn.role) }}>
+              {ROLES.find((r) => r.key === drawn.role)?.label || drawn.role}
+            </div>
+            <div className="text-2xl font-bold" style={{ color: CREAM, fontFamily: DISPLAY_FONT }}>
+              {drawn.name}
+            </div>
+            <div className="text-sm mt-1" style={{ color: "rgba(243,239,228,0.6)" }}>
+              {drawn.team || "—"}
+              {drawn.price != null ? ` · quotazione ${drawn.price}` : ""}
+            </div>
+          </div>
+        ) : (
+          <div
+            className="rounded-lg p-6 mb-3 text-center text-sm"
+            style={{ background: "rgba(243,239,228,0.05)", color: "rgba(243,239,228,0.4)" }}
+          >
+            {pool.length ? "Nessun giocatore estratto" : "Nessun giocatore libero per questo filtro"}
+          </div>
+        )}
+
+        <button
+          onClick={draw}
+          disabled={!pool.length}
+          className="w-full rounded-lg py-3 font-bold tracking-wide"
+          style={{
+            background: pool.length ? GOLD : "rgba(243,239,228,0.1)",
+            color: pool.length ? BG : "rgba(243,239,228,0.4)",
+            fontFamily: DISPLAY_FONT,
+          }}
+        >
+          {drawn ? "Estrai un altro" : "Estrai giocatore"}
+        </button>
+      </div>
+
+      {drawn && (
+        <div className="rounded-xl p-3" style={{ background: CARD_BG }}>
+          <div className="font-semibold mb-2" style={{ color: CREAM, fontFamily: DISPLAY_FONT }}>
+            Assegna a una squadra
+          </div>
+          <select
+            value={teamId}
+            onChange={(e) => setTeamId(Number(e.target.value))}
+            className="w-full rounded-lg px-3 py-2.5 text-sm mb-2"
+            style={inputStyle}
+          >
+            {teams.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.name} — {teamStats(t).remaining} cr
+              </option>
+            ))}
+          </select>
+          <input
+            type="number"
+            inputMode="numeric"
+            placeholder="Prezzo pagato"
+            value={price}
+            onChange={(e) => setPrice(e.target.value)}
+            className="w-full rounded-lg px-3 py-2.5 text-sm mb-3"
+            style={{ ...inputStyle, fontFamily: MONO_FONT }}
+          />
+          <div className="flex gap-2">
+            <button onClick={assign} className="flex-1 rounded-lg py-2.5 text-sm font-bold" style={{ background: GOLD, color: BG }}>
+              Assegna
+            </button>
+            <button
+              onClick={() => setDrawn(null)}
+              className="rounded-lg px-4 py-2.5 text-sm font-semibold"
+              style={{ background: "rgba(243,239,228,0.08)", color: CREAM }}
+            >
+              Scarta
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
