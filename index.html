@@ -1,0 +1,2004 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no" />
+<title>Asta Fantacalcio</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet" />
+<style>
+  html, body { margin: 0; padding: 0; background: #0E3B2E; -webkit-tap-highlight-color: transparent; }
+  * { box-sizing: border-box; }
+  body { font-family: 'Outfit', system-ui, -apple-system, sans-serif; }
+  input, select, textarea, button { font-family: inherit; }
+  input:focus, select:focus, textarea:focus { outline: 2px solid #D4A017; outline-offset: 1px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+
+const { useState, useEffect, useCallback, useMemo, useRef } = React;
+
+/* ---------- Supabase backend ----------
+   Lo stato dell'asta vive nello schema relazionale `fanta` (auctions, teams,
+   players, assignments) su Supabase, sincronizzato in realtime tra tutti i
+   dispositivi collegati alla stessa asta. */
+const SUPABASE_URL = "https://idoyhbdgxsirnysgxmqh.supabase.co";
+const SUPABASE_KEY = "sb_publishable_Cn2peORmtyEVnA1vHl2UOw_oUDGc0NF";
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+  db: { schema: "fanta" },
+});
+
+const Db = {
+  async getOrCreateAuction() {
+    const { data: rows, error } = await sb
+      .from("auctions")
+      .select("*")
+      .order("created_at", { ascending: true })
+      .limit(1);
+    if (error) throw error;
+    if (rows.length) return rows[0];
+    const { data, error: insErr } = await sb.from("auctions").insert({}).select().single();
+    if (insErr) throw insErr;
+    return data;
+  },
+
+  async getOrCreateTeams(auctionId) {
+    const { data: existing, error } = await sb
+      .from("teams")
+      .select("*")
+      .eq("auction_id", auctionId)
+      .order("slot");
+    if (error) throw error;
+    const have = new Set(existing.map((t) => t.slot));
+    const missing = [];
+    for (let i = 0; i < 10; i++) {
+      if (!have.has(i)) {
+        missing.push({ auction_id: auctionId, slot: i, name: i === 0 ? "La mia squadra" : `Squadra ${i + 1}` });
+      }
+    }
+    if (!missing.length) return existing;
+    const { error: insErr } = await sb.from("teams").insert(missing);
+    if (insErr) throw insErr;
+    const { data: all, error: reErr } = await sb
+      .from("teams")
+      .select("*")
+      .eq("auction_id", auctionId)
+      .order("slot");
+    if (reErr) throw reErr;
+    return all;
+  },
+
+  async loadAssignments(auctionId) {
+    const { data, error } = await sb.from("assignments").select("*").eq("auction_id", auctionId).order("seq");
+    if (error) throw error;
+    return data;
+  },
+
+  async loadPlayers(auctionId) {
+    const { data, error } = await sb.from("players").select("*").eq("auction_id", auctionId).order("name");
+    if (error) throw error;
+    return data;
+  },
+
+  async updateAuctionSettings(auctionId, { budget, roster }) {
+    const { error } = await sb
+      .from("auctions")
+      .update({ budget, roster })
+      .eq("id", auctionId);
+    if (error) throw error;
+  },
+
+  async renameTeam(teamDbId, name) {
+    const { error } = await sb.from("teams").update({ name }).eq("id", teamDbId);
+    if (error) throw error;
+  },
+
+  async resetTeamNames(auctionId, teamDbIdBySlot) {
+    for (let slot = 0; slot < 10; slot++) {
+      const dbId = teamDbIdBySlot.get(slot);
+      if (!dbId) continue;
+      const name = slot === 0 ? "La mia squadra" : `Squadra ${slot + 1}`;
+      await sb.from("teams").update({ name }).eq("id", dbId);
+    }
+  },
+
+  async insertAssignment(auctionId, teamDbId, name, role, price) {
+    const { data, error } = await sb
+      .from("assignments")
+      .insert({ auction_id: auctionId, team_id: teamDbId, player_name: name, role, price })
+      .select()
+      .single();
+    if (error) throw error;
+    return data;
+  },
+
+  async deleteAssignment(assignmentId) {
+    const { error } = await sb.from("assignments").delete().eq("id", assignmentId);
+    if (error) throw error;
+  },
+
+  async clearAssignments(auctionId) {
+    const { error } = await sb.from("assignments").delete().eq("auction_id", auctionId);
+    if (error) throw error;
+  },
+
+  async replacePlayers(auctionId, players) {
+    const { error: delErr } = await sb.from("players").delete().eq("auction_id", auctionId);
+    if (delErr) throw delErr;
+    if (!players.length) return;
+    const rows = players.map((p) => ({
+      auction_id: auctionId,
+      name: p.name,
+      role: p.role,
+      team: p.team || null,
+      price: p.price,
+    }));
+    const { error: insErr } = await sb.from("players").insert(rows);
+    if (insErr) throw insErr;
+  },
+};
+
+function assembleTeams(teamRows, assignmentRows) {
+  const byTeamDbId = new Map(teamRows.map((t) => [t.id, []]));
+  assignmentRows.forEach((a) => {
+    const arr = byTeamDbId.get(a.team_id);
+    if (arr) arr.push({ id: a.id, name: a.player_name, role: a.role, price: a.price, order: Number(a.seq) });
+  });
+  return teamRows
+    .slice()
+    .sort((a, b) => a.slot - b.slot)
+    .map((t) => ({ id: t.slot, name: t.name, players: byTeamDbId.get(t.id) || [] }));
+}
+
+/* ---------- design tokens ---------- */
+
+const BG = "#0E3B2E";
+const CARD_BG = "#154A3A";
+const GOLD = "#D4A017";
+const CREAM = "#F3EFE4";
+const DANGER = "#E06C5C";
+const DISPLAY_FONT = "'Outfit', system-ui, -apple-system, sans-serif";
+const MONO_FONT = "'JetBrains Mono', ui-monospace, SFMono-Regular, monospace";
+const FONT_IMPORT = "";
+
+/* ---------- constants ---------- */
+
+const ROLES = [
+  { key: "P", label: "Portieri", color: "#D4A017" },
+  { key: "D", label: "Difensori", color: "#2E8B77" },
+  { key: "C", label: "Centrocampisti", color: "#8C7AE6" },
+  { key: "A", label: "Attaccanti", color: "#C1443C" },
+];
+const ROLE_KEYS = ROLES.map((r) => r.key);
+const ROLE_COLORS = ROLES.reduce((m, r) => ((m[r.key] = r.color), m), {});
+const roleColor = (key) => ROLE_COLORS[key] || CREAM;
+
+/* Listone precaricato (quotazioni ufficiali 2026/27, giocatori principali).
+   name, role, team, quotazione */
+const DEFAULT_PLAYERS_RAW = [
+  ['Alessio Romagnoli','D','Lazio',10],
+  ['Marten De Roon','C','Atalanta',10],
+  ['Adam Marusic','D','Lazio',10],
+  ['Enrico Del Prato','D','Parma',10],
+  ['Nemanja Matic','C','Sassuolo',10],
+  ['Hamed Junior Traore','C','Genoa',10],
+  ['Ndary Adopo','C','Cagliari',10],
+  ['Nicolo Rovella','C','Lazio',10],
+  ['Andrea Adorante','A','Venezia',10],
+  ['Hans Nicolussi Caviglia','C','Parma',10],
+  ['Daniel Maldini','C','Cagliari',10],
+  ['Fikayo Tomori','D','Milan',10],
+  ['Toma Basic','C','Venezia',10],
+  ['Teun Koopmeiners','C','Juventus',10],
+  ['Carlos Augusto','D','Inter',10],
+  ['Zeki Celik','D','Juventus',10],
+  ['Mikael Ellertsson','C','Genoa',10],
+  ['Harry Winks','C','Cagliari',10],
+  ['Niccolo Pisilli','C','Roma',10],
+  ['Christos Mandas','P','Lazio',10],
+  ['Mattia Liberali','A','Como',10],
+  ['Saul Coco','D','Torino',10],
+  ['Brooke Norton-Cuffy','D','Genoa',10],
+  ['Youssouf Fofana','C','Milan',10],
+  ['Mandela Keita','C','Parma',10],
+  ['Tiago Gabriel','D','Lecce',10],
+  ['Kike Perez','C','Venezia',10],
+  ['Jayden Addai','A','Como',10],
+  ['Giovane','A','Napoli',10],
+  ['Omri Gandelman','C','Lecce',10],
+  ['Victor Valdepenas','D','Fiorentina',10],
+  ['Christ Oulai','C','Fiorentina',10],
+  ['Konstantinos Koulierakis','D','Roma',10],
+  ['Yan Couto','D','Como',10],
+  ['Davide Frattesi','C','Lazio',11],
+  ['Yerry Mina','D','Cagliari',11],
+  ['Tommaso Pobega','C','Bologna',11],
+  ['Gianluca Busio','C','Venezia',11],
+  ['Jacopo Fazzini','C','Cagliari',11],
+  ['Jhon Lucumi','D','Juventus',11],
+  ['Samuel Chukwueze','A','Milan',11],
+  ['Zion Suzuki','P','Parma',11],
+  ['Jesper Karlstrom','C','Udinese',11],
+  ['Alex Valle','D','Como',11],
+  ['Santiago Gimenez','A','Milan',11],
+  ['Edon Zhegrova','A','Juventus',11],
+  ['Justin Bijlow','P','Genoa',11],
+  ['Danilho Doekhi','D','Lazio',11],
+  ['Wladimiro Falcone','P','Lecce',12],
+  ['Leonardo Spinazzola','D','Napoli',12],
+  ['Michele Di Gregorio','P','Juventus',12],
+  ['Giacomo Calo','C','Frosinone',12],
+  ['Alessandro Buongiorno','D','Napoli',12],
+  ['Matteo Gabbia','D','Milan',12],
+  ['Matteo Pessina','C','Monza',12],
+  ['Henrikh Mkhitaryan','C','Inter',12],
+  ['Elia Caprile','P','Cagliari',12],
+  ['Nicola Zalewski','C','Atalanta',12],
+  ['Gaetano Pio Oristanio','C','Torino',12],
+  ['Radu Dragusin','D','Fiorentina',12],
+  ['Cristian Volpato','C','Sassuolo',12],
+  ['Antonio Vergara','C','Napoli',12],
+  ['Morten Frendrup','C','Genoa',12],
+  ['Emanuele Valeri','D','Parma',12],
+  ['Davide Bartesaghi','D','Milan',12],
+  ['Maduka Okoye','P','Udinese',12],
+  ['Alex Jimenez','D','Fiorentina',12],
+  ['Santiago Pierotti','A','Lecce',12],
+  ['Tijjani Noslin','A','Lazio',12],
+  ['Juan Miranda','D','Bologna',12],
+  ['Marc Kempf','D','Como',12],
+  ['Kamaldeen Sulemana','A','Atalanta',12],
+  ['Davide Zappacosta','D','Atalanta',13],
+  ['Andrea Colpani','C','Monza',13],
+  ['Gianluca Gaetano','C','Atalanta',13],
+  ['Jeremie Boga','A','Juventus',13],
+  ['Antonio Raimondo','A','Frosinone',13],
+  ['Johan Vasquez','D','Genoa',13],
+  ['Dodo','D','Fiorentina',13],
+  ['Boulaye Dia','A','Lazio',13],
+  ['Isak Hien','D','Atalanta',13],
+  ['Mario Hermoso','D','Roma',13],
+  ['Maxence Caqueret','C','Como',13],
+  ['Cher Ndour','C','Fiorentina',13],
+  ['Unai Gomez','C','Udinese',13],
+  ['Willem Geubbels','A','Lecce',13],
+  ['Trevoh Chalobah','D','Como',13],
+  ['Jose David Romero','A','Parma',13],
+  ['Lukasz Skorupski','P','Bologna',14],
+  ['Bryan Cristante','C','Roma',14],
+  ['Federico Bernardeschi','D','Bologna',14],
+  ['Manuel Locatelli','C','Juventus',14],
+  ['Nicolo Cambiaghi','A','Bologna',14],
+  ['Stanislav Lobotka','C','Napoli',14],
+  ['Matteo Cancellieri','A','Lazio',14],
+  ['Lewis Ferguson','C','Bologna',14],
+  ['Fares Ghedjemis','C','Frosinone',14],
+  ['Adrian Bernabe','C','Parma',14],
+  ['David Neres','A','Napoli',14],
+  ['Ismael Kone','C','Sassuolo',14],
+  ['Alisson Santos','A','Napoli',14],
+  ['Akor Adams','A','Venezia',14],
+  ['Djibril Sow','C','Genoa',14],
+  ['Romano Schmid','C','Frosinone',14],
+  ['Alex Meret','P','Napoli',15],
+  ['Rolando Mandragora','C','Fiorentina',15],
+  ['Patrick Cutrone','A','Monza',15],
+  ['Jens Odgaard','A','Bologna',15],
+  ['Nicolo Fagioli','C','Fiorentina',15],
+  ['Andrea Cambiaso','D','Juventus',15],
+  ['Leo Ostigard','D','Genoa',15],
+  ['Mario Gila','D','Milan',15],
+  ['Lameck Banda','A','Lecce',15],
+  ['Gustav Isaksen','A','Lazio',15],
+  ['Mateo Pellegrino','A','Fiorentina',15],
+  ['Ange-Yoan Bonny','A','Inter',15],
+  ['Jurgen Ekkelenkamp','C','Udinese',15],
+  ['John Yeboah','A','Venezia',15],
+  ['Jacobo Ramon','D','Como',15],
+  ['Nikola Stulic','A','Lecce',15],
+  ['Petar Ratkov','A','Lazio',15],
+  ['Kevin Carlos','A','Cagliari',15],
+  ['Duvan Zapata','A','Torino',16],
+  ['David De Gea','P','Fiorentina',16],
+  ['Mario Pasalic','C','Atalanta',16],
+  ['Roberto Piccoli','A','Bologna',16],
+  ['Giorgio Scalvini','D','Atalanta',16],
+  ['Vitinha','A','Genoa',16],
+  ['Che Adams','A','Torino',16],
+  ['Petar Sucic','C','Inter',16],
+  ['Kieron Bowie','A','Sassuolo',16],
+  ['John Stones','D','Inter',17],
+  ['Alexis Saelemaekers','D','Milan',17],
+  ['Tommaso Baldanzi','C','Genoa',17],
+  ['Cesare Casadei','C','Torino',17],
+  ['Kristian Thorstvedt','C','Sassuolo',17],
+  ['Yann Aurel Bisseck','D','Inter',17],
+  ['Maximo Perrone','C','Como',17],
+  ['Piotr Zielinski','C','Inter',18],
+  ['Pierre Kalulu','D','Juventus',18],
+  ['Evan Ndicka','D','Roma',18],
+  ['Djed Spence','D','Inter',18],
+  ['Khephren Thuram','C','Juventus',18],
+  ['Oumar Solet','D','Udinese',18],
+  ['Jonathan David','A','Juventus',18],
+  ['Giovanni Di Lorenzo','D','Napoli',19],
+  ['Amir Rrahmani','D','Napoli',19],
+  ['Lazar Samardzic','C','Atalanta',19],
+  ['Andre Zambo Anguissa','C','Napoli',19],
+  ['Jean Butez','P','Como',19],
+  ['Matteo Politano','A','Napoli',20],
+  ['Lorenzo Pellegrini','C','Roma',20],
+  ['Gianluca Mancini','D','Roma',20],
+  ['Marco Carnesecchi','P','Atalanta',20],
+  ['Lorenzo Colombo','A','Genoa',20],
+  ['Mike Maignan','P','Milan',20],
+  ['Josep Martinez','P','Inter',20],
+  ['Strahinja Pavlovic','D','Milan',20],
+  ['Manu Kone','C','Roma',20],
+  ['Kenneth Taylor','C','Lazio',20],
+  ['Kerim Alajbegovic','A','Juventus',20],
+  ['Luka Modric','C','Milan',21],
+  ['Alessandro Bastoni','D','Inter',21],
+  ['Manuel Akanji','D','Inter',21],
+  ['Gleison Bremer','D','Juventus',21],
+  ['Nahuel Molina','D','Roma',21],
+  ['Ederson','C','Atalanta',21],
+  ['Francisco Conceicao','A','Juventus',21],
+  ['Assane Diao','A','Como',21],
+  ['Jesus Rodriguez','A','Como',21],
+  ['Wesley','D','Roma',21],
+  ['Jonathan Rowe','A','Bologna',21],
+  ['Sebastiano Esposito','A','Cagliari',22],
+  ['Mile Svilar','P','Roma',22],
+  ['Giacomo Raspadori','A','Atalanta',23],
+  ['Matias Soule','A','Roma',23],
+  ['Arthur Atta','C','Fiorentina',23],
+  ['Christopher Nkunku','A','Milan',23],
+  ['Franco Mastantuono','C','Fiorentina',23],
+  ['Albert Gudmundsson','A','Fiorentina',24],
+  ['Weston McKennie','C','Juventus',24],
+  ['Artem Dovbyk','A','Bologna',24],
+  ['Nikola Vlasic','C','Torino',25],
+  ['Nicolo Barella','C','Inter',26],
+  ['Lucas Da Cunha','A','Como',26],
+  ['Francesco Pio Esposito','A','Inter',26],
+  ['Mattia Zaccagni','A','Lazio',27],
+  ['Andrea Pinamonti','A','Sassuolo',27],
+  ['Armand Laurienté','A','Sassuolo',27],
+  ['Santiago Castro','A','Roma',27],
+  ['Paulo Dybala','A','Roma',28],
+  ['Kevin De Bruyne','C','Napoli',28],
+  ['Giovanni Simeone','A','Torino',28],
+  ['Nicolo Zaniolo','A','Udinese',28],
+  ['Charles De Ketelaere','A','Atalanta',28],
+  ['Federico Dimarco','D','Inter',30],
+  ['Adrien Rabiot','C','Milan',30],
+  ['Rafael Leao','A','Milan',30],
+  ['Nikola Krstovic','A','Atalanta',30],
+  ['Domenico Berardi','A','Sassuolo',31],
+  ['Martin Baturina','C','Como',31],
+  ['Keinan Davis','A','Udinese',33],
+  ['Riccardo Orsolini','A','Bologna',34],
+  ['Gianluca Scamacca','A','Atalanta',34],
+  ['Hakan Calhanoglu','C','Inter',36],
+  ['Kenan Yildiz','A','Juventus',36],
+  ['Tasos Douvikas','A','Como',36],
+  ['Christian Pulisic','A','Milan',38],
+  ['Scott McTominay','C','Napoli',38],
+  ['Moise Kean','A','Fiorentina',41],
+  ['Nico Paz','C','Como',43],
+  ['Randal Kolo Muani','A','Juventus',44],
+  ['Goncalo Ramos','A','Milan',46],
+  ['Rasmus Hojlund','A','Napoli',47],
+  ['Marcus Thuram','A','Inter',47],
+  ['Donyell Malen','A','Roma',53],
+  ['Lautaro Martinez','A','Inter',55],
+  ['Yael Trepy','A','Cagliari',1],
+  ['Andres Cuenca','D','Como',1],
+  ['David Puczka','D','Genoa',2],
+  ['Alfonso Pedraza','D','Lazio',9],
+  ['Daniele Padelli','P','Udinese',1],
+  ['Marco Sportiello','P','Atalanta',1],
+  ['Emil Audero','P','Como',1],
+  ['Luca Lezzerini','P','Fiorentina',1],
+  ['Daniele Sommariva','P','Genoa',1],
+  ['Boris Radunovic','P','Cagliari',1],
+  ['Giacomo Satalino','P','Sassuolo',1],
+  ['Raffaele Di Gennaro','P','Inter',1],
+  ['Nikita Contini','P','Napoli',1],
+  ['Francesco Rossi','P','Atalanta',1],
+  ['Carlo Pinsoglio','P','Juventus',1],
+  ['Pierluigi Gollini','P','Roma',1],
+  ['Semuel Pizzignacco','P','Monza',1],
+  ['Mauro Vigorito','P','Como',1],
+  ['Alessandro Russo','P','Sassuolo',1],
+  ['Nunzio Lella','C','Venezia',1],
+  ['Stefano Turati','P','Sassuolo',1],
+  ['Alessio Furlanetto','P','Lazio',1],
+  ['Franco Israel','P','Torino',1],
+  ['Wisdom Amey','D','Frosinone',1],
+  ['Niccolo Corrado','D','Frosinone',1],
+  ['Edoardo Piana','P','Udinese',1],
+  ['Nicolas Galazzi','A','Monza',1],
+  ['Nicolo Cavuoti','C','Cagliari',1],
+  ['Eldin Lolic','P','Frosinone',1],
+  ['Yeferson Paz','D','Sassuolo',1],
+  ['Alexandru Borbei','P','Lecce',1],
+  ['James Abankwah','D','Udinese',1],
+  ['Luigi Cherubini','A','Roma',1],
+  ['Devis Vasquez','P','Roma',1],
+  ['Davide Renzetti','P','Lazio',1],
+  ['Alan Matturro','D','Genoa',1],
+  ['Oliver Christensen','P','Fiorentina',1],
+  ['Paolo Vismara','P','Atalanta',1],
+  ['Franz Stolz','P','Genoa',1],
+  ['Alen Sherri','P','Cagliari',1],
+  ['Alessandro Gabrielloni','A','Como',1],
+  ['Vernon Addo','D','Lecce',1],
+  ['Lorenzo Torriani','P','Milan',1],
+  ['Matteo Grandi','P','Venezia',1],
+  ['Massimo Pessina','P','Bologna',1],
+  ['Giorgio De Marzi','P','Roma',1],
+  ['Joseph Liteta','C','Cagliari',1],
+  ['Eman Kospo','D','Fiorentina',1],
+  ['Matias Perez','D','Lecce',1],
+  ['Rachid Kouda','C','Parma',1],
+  ['Abdoulaye Camara','C','Udinese',1],
+  ['Giulio Vinciati','A','Udinese',1],
+  ['Corrie Ndaba','D','Lecce',1],
+  ['Olaf Gorter','C','Lecce',1],
+  ['Niko Kovac','C','Lecce',1],
+  ['Plamen Penev','P','Lecce',1],
+  ['Jan Ziolkowski','D','Roma',1],
+  ['David Odogu','D','Milan',1],
+  ['Ernestas Lysionok','P','Genoa',1],
+  ['Ukko Happonen','P','Bologna',1],
+  ['Valerio Farcomeni','C','Lazio',1],
+  ['Lapo Siviero','P','Torino',1],
+  ['Noel Tornqvist','P','Como',1],
+  ['Tommaso Macchioni','D','Sassuolo',1],
+  ['Adrian Przyborek','D','Lazio',1],
+  ['Adrian Lahdo','C','Como',1],
+  ['Alejandro Furtado Gomes','D','Venezia',1],
+  ['Calixte Paul Ligue','D','Venezia',1],
+  ['Alessio Pozzi','P','Venezia',1],
+  ['Samuel Wiafe','C','Genoa',1],
+  ['Bruno Galassi','C','Lazio',1],
+  ['Matteo Pisseri','P','Frosinone',1],
+  ['Muhammed Colley','A','Frosinone',1],
+  ['Diego Mascardi','P','Torino',1],
+  ['Hjalte Laerke','A','Lecce',1],
+  ['Demi Akarakiri','C','Cagliari',1],
+  ['Lion Lauberbach','A','Venezia',1],
+  ['Matteo Dagasso','C','Venezia',1],
+  ['Aljaz Strajnar','P','Monza',1],
+  ['Jeremy Oyono','D','Frosinone',1],
+  ['Anouar El Azzouzi','C','Frosinone',1],
+  ['Lorenzo De Silvestri','D','Bologna',2],
+  ['Daniele Rugani','D','Juventus',2],
+  ['Nicholas Pierini','A','Sassuolo',2],
+  ['Pietro Terracciano','P','Milan',2],
+  ['Edoardo Corvi','P','Parma',2],
+  ['Franco Ezequiel Carboni','D','Parma',2],
+  ['Valentin Antov','D','Monza',2],
+  ['Edoardo Iannoni','C','Sassuolo',2],
+  ['Filippo Missori','D','Sassuolo',2],
+  ['Edoardo Pieragnolo','D','Sassuolo',2],
+  ['Luca D\'Andrea','C','Sassuolo',2],
+  ['Adam Bakoune','D','Monza',2],
+  ['Ali Dembele','D','Torino',2],
+  ['Alphadjo Cisse','A','Milan',2],
+  ['Mitchel Bakker','D','Atalanta',2],
+  ['Mohamed Kaba','C','Lecce',2],
+  ['Matthias Braunoder','C','Como',2],
+  ['Peter Amoran','D','Parma',2],
+  ['Muati Rui Modesto','D','Udinese',2],
+  ['Ivan Azon','A','Como',2],
+  ['Owen Kouassi','D','Lecce',2],
+  ['Laurs Skjellerup','A','Sassuolo',2],
+  ['Sadik Fofana','C','Lecce',2],
+  ['Agustin Albarracin','A','Cagliari',2],
+  ['Branimir Mlacic','D','Udinese',2],
+  ['Manga Foe Ondoa','C','Monza',2],
+  ['Alvin Obinna Okoro','A','Venezia',2],
+  ['Kornel Lisman','A','Venezia',2],
+  ['Filippo Grosso','C','Frosinone',2],
+  ['Antonio Casas','A','Venezia',2],
+  ['Andrea Luongo','C','Torino',2],
+  ['Edoardo Goldaniga','D','Como',3],
+  ['Ivan Provedel','P','Inter',3],
+  ['Ben Lhassine Kone','C','Frosinone',3],
+  ['Andrea Ghion','C','Sassuolo',3],
+  ['Pasquale Mazzocchi','D','Napoli',3],
+  ['Sebastiano Desplanches','P','Frosinone',3],
+  ['Emil Bohinen','C','Venezia',3],
+  ['Anthony Oyono','D','Frosinone',3],
+  ['Luca Moro','A','Sassuolo',3],
+  ['Oier Zarraga','C','Udinese',3],
+  ['Reda Belahyane','C','Lazio',3],
+  ['Cas Odenthal','D','Sassuolo',3],
+  ['Matteo Palma','D','Udinese',3],
+  ['Gaby Jean','D','Lecce',3],
+  ['Samuel Gigot','D','Lazio',3],
+  ['Eddy Kouadio','D','Monza',3],
+  ['Sebastian Otoa','D','Genoa',3],
+  ['Arvid Brorsson','D','Monza',3],
+  ['Vakoun Bayo','A','Udinese',3],
+  ['Abdoulaye Ndiaye','D','Parma',3],
+  ['Benjamin Cremaschi','C','Parma',3],
+  ['Bartol Franjic','D','Venezia',3],
+  ['Sankhoun Diawara','D','Milan',3],
+  ['Jacopo Gelli','D','Frosinone',3],
+  ['Kevin Akpoguma','D','Frosinone',3],
+  ['Mattia Perin','P','Juventus',4],
+  ['Cristiano Biraghi','D','Torino',4],
+  ['Patric','D','Lazio',4],
+  ['Stefano Sabelli','D','Genoa',4],
+  ['Arek Milik','A','Juventus',4],
+  ['Aleksa Terzic','D','Frosinone',4],
+  ['Botond Balogh','D','Parma',4],
+  ['Giuseppe Aurelio','D','Cagliari',4],
+  ['Nicolo Casale','D','Bologna',4],
+  ['Ivan Ilic','C','Torino',4],
+  ['Romano Floriani Mussolini','D','Lazio',4],
+  ['Giorgio Cittadini','D','Frosinone',4],
+  ['Enzo Ebosse','D','Udinese',4],
+  ['Juan Cabal','D','Juventus',4],
+  ['Oussama El Azzouzi','C','Bologna',4],
+  ['Giovanni Daffara','P','Parma',4],
+  ['Luca Marianucci','D','Napoli',4],
+  ['Saba Goglichidze','D','Udinese',4],
+  ['Omari Forson','A','Monza',4],
+  ['Rafa Marin','D','Napoli',4],
+  ['Marin Sverko','D','Venezia',4],
+  ['Richie Sagrado','D','Venezia',4],
+  ['Ignace Van der Brempt','D','Como',4],
+  ['Tino Anjorin','C','Torino',4],
+  ['Riyad Idrissi','D','Cagliari',4],
+  ['Eivind Helland','D','Bologna',4],
+  ['Paul Mendy','A','Cagliari',4],
+  ['Giorgi Chakvetadze','C','Udinese',4],
+  ['Abdel Rahim Bonkano Alhassane','D','Bologna',4],
+  ['Yanis Massolin','C','Inter',4],
+  ['Ousmane Diallo Thiao','C','Parma',4],
+  ['Simone Lontani','A','Parma',4],
+  ['Alfred Duncan','C','Venezia',5],
+  ['Alessandro Deiola','C','Cagliari',5],
+  ['Luca Pellegrini','D','Lazio',5],
+  ['Manuel Lazzari','D','Lazio',5],
+  ['Daniel Boloca','C','Sassuolo',5],
+  ['Alberto Paleari','P','Torino',5],
+  ['Youssef Maleh','C','Lecce',5],
+  ['Alessandro Zanoli','D','Udinese',5],
+  ['Thorir Helgason','C','Venezia',5],
+  ['Alberto Dossena','D','Como',5],
+  ['Luca Lipani','C','Sassuolo',5],
+  ['El Bilal Toure','A','Parma',5],
+  ['Yunus Musah','C','Milan',5],
+  ['Luis Hasa','C','Frosinone',5],
+  ['Jesper Karlsson','A','Bologna',5],
+  ['Seydou Fini','A','Frosinone',5],
+  ['Antoine Hainaut','D','Venezia',5],
+  ['Mario Mitaj','D','Genoa',5],
+  ['Lorenzo Lucchesi','D','Monza',5],
+  ['Gabriele Calvani','D','Frosinone',5],
+  ['Patrizio Masini','C','Frosinone',5],
+  ['Niccolo Fortini','D','Fiorentina',5],
+  ['Joel Schingtienne','D','Venezia',5],
+  ['Fali Cande','D','Sassuolo',5],
+  ['Anass Salah-Eddine','D','Roma',5],
+  ['Pervis Estupinan','D','Milan',5],
+  ['Christian Ordonez','C','Parma',5],
+  ['Zakaria Aboukhlal','A','Torino',5],
+  ['Mariano Troilo','D','Parma',5],
+  ['Adam Buksa','A','Udinese',5],
+  ['Juan Rodriguez','D','Cagliari',5],
+  ['Juan Arizala','D','Udinese',5],
+  ['Robinio Vaz','A','Roma',5],
+  ['Edoardo Motta','P','Lazio',5],
+  ['Sead Kolasinac','D','Atalanta',6],
+  ['Andrea Petagna','A','Monza',6],
+  ['Luca Mazzitelli','C','Como',6],
+  ['Andrea Carboni','D','Monza',6],
+  ['Filippo Terracciano','D','Milan',6],
+  ['Junior Messias','A','Genoa',6],
+  ['Koni De Winter','D','Milan',6],
+  ['Kristjan Asllani','C','Inter',6],
+  ['Nicolo Bertola','D','Udinese',6],
+  ['Filippo Delli Carri','D','Monza',6],
+  ['Ridgeciano Haps','D','Venezia',6],
+  ['Federico Gatti','D','Juventus',6],
+  ['Samuele Birindelli','D','Monza',6],
+  ['Patrick Ciurria','A','Monza',6],
+  ['Sandi Lovric','C','Udinese',6],
+  ['Aleksandar Stankovic','C','Inter',6],
+  ['Leonardo Colombo','C','Monza',6],
+  ['Francesco Gelli','C','Frosinone',6],
+  ['Lorenzo Palmisani','P','Frosinone',6],
+  ['Lorenzo Venturino','A','Genoa',6],
+  ['Matias Moreno','D','Venezia',6],
+  ['Alessandro Romano','C','Cagliari',6],
+  ['Konan N\'Dri','A','Lecce',6],
+  ['Oliver Provstgaard','D','Lazio',6],
+  ['Joao Mario Neto Lopes','D','Fiorentina',6],
+  ['Lennon Miller','C','Udinese',6],
+  ['Jamil Siebert','D','Lecce',6],
+  ['Sascha Britschgi','D','Parma',6],
+  ['Nesta Elphege','A','Parma',6],
+  ['Gustavo Miguel Pereira de Sousa','A','Monza',6],
+  ['Eray Ervin Comert','D','Torino',6],
+  ['Raphael Kofler','D','Cagliari',6],
+  ['Redouane Halhal','D','Venezia',6],
+  ['Keita Balde','A','Monza',6],
+  ['Michael Folorunsho','C','Napoli',7],
+  ['Vanja Milinkovic','P','Napoli',7],
+  ['Riccardo Sottil','A','Fiorentina',7],
+  ['Luca Ranieri','D','Fiorentina',7],
+  ['Gabriele Zappa','D','Cagliari',7],
+  ['Demba Thiam','P','Monza',7],
+  ['Marco Brescianini','C','Fiorentina',7],
+  ['Samuele Ricci','C','Milan',7],
+  ['Ilario Monterisi','D','Frosinone',7],
+  ['Lautaro Valenti','D','Parma',7],
+  ['Fabiano Parisi','D','Fiorentina',7],
+  ['Nicolas Gonzalez','A','Juventus',7],
+  ['Fabio Miretti','C','Juventus',7],
+  ['Josh Doig','D','Sassuolo',7],
+  ['Warren Bondo','C','Milan',7],
+  ['Ibrahim Sulemana','C','Atalanta',7],
+  ['Marin Pongracic','D','Fiorentina',7],
+  ['Cyril Ngonge','A','Napoli',7],
+  ['Pontus Almqvist','A','Parma',7],
+  ['Hassane Kamara','D','Udinese',7],
+  ['Daniele Ghilardi','D','Roma',7],
+  ['Matteo Prati','C','Cagliari',7],
+  ['Kingstone Mutandwa','A','Cagliari',7],
+  ['Douglas Luiz','C','Juventus',7],
+  ['Vasilije Adzic','C','Sassuolo',7],
+  ['Kialonda Gaspar','D','Lecce',7],
+  ['Jeff Ekhator','A','Juventus',7],
+  ['Alieu Fadera','A','Como',7],
+  ['Odilon Kossounou','D','Atalanta',7],
+  ['Billy Gilmour','C','Napoli',7],
+  ['Danilo de Melo Veiga','D','Lecce',7],
+  ['Ivan Smolcic','D','Como',7],
+  ['Alessio Cacciamani','D','Torino',7],
+  ['Martin Vitik','D','Bologna',7],
+  ['Nicolas Kuhn','A','Como',7],
+  ['Noa Lang','A','Napoli',7],
+  ['Neil El Aynaoui','C','Roma',7],
+  ['Oliver Sorensen','C','Parma',7],
+  ['Ze Pedro da Silva Figueiredo Freitas','D','Cagliari',7],
+  ['Idrissa Gueye','A','Udinese',7],
+  ['Oumar Ngom','C','Lecce',7],
+  ['Alex Amorim','C','Genoa',7],
+  ['Darryl Bakola','C','Sassuolo',7],
+  ['Ricardo Luis Chaby Mangas','D','Monza',7],
+  ['Thierry Rendall Correia','D','Venezia',7],
+  ['Kian Fitz-Jim','C','Torino',7],
+  ['Bruno Da Silva Kaiki','D','Como',7],
+  ['Mikel Jesus Amondarain','C','Bologna',7],
+  ['Gabriele Bracaglia','D','Frosinone',7],
+  ['Matteo Cichella','C','Frosinone',7],
+  ['Danilo Cataldi','C','Lazio',8],
+  ['Christian Kabasele','D','Udinese',8],
+  ['Alessio Zerbin','A','Frosinone',8],
+  ['Sebastian Walukiewicz','D','Sassuolo',8],
+  ['Simon Sohm','C','Venezia',8],
+  ['Adam Obert','D','Cagliari',8],
+  ['Giovanni Fabbian','C','Fiorentina',8],
+  ['Mathias Olivera','D','Napoli',8],
+  ['Medon Berisha','C','Lecce',8],
+  ['Emirhan Ilkhan','C','Torino',8],
+  ['Alieu Njie','A','Torino',8],
+  ['Walid Cheddira','A','Napoli',8],
+  ['Marcus Pedersen','D','Torino',8],
+  ['Francesco Camarda','A','Milan',8],
+  ['Ebenezer Akinsanmiro','C','Monza',8],
+  ['Alessandro Circati','D','Parma',8],
+  ['Benjamin Dominguez','A','Sassuolo',8],
+  ['Lloyd Kelly','D','Juventus',8],
+  ['Matija Frigan','A','Parma',8],
+  ['Armel Bella-Kotchap','D','Venezia',8],
+  ['Sandro Kulenovic','A','Torino',8],
+  ['Franz-Ethan Meichtry','C','Genoa',8],
+  ['Viery Viery','D','Fiorentina',8],
+  ['Ilias Koutsoupias','C','Frosinone',8],
+  ['Florian Grillitsch','C','Frosinone',8],
+  ['Alvaro Morata','A','Como',9],
+  ['Raoul Bellanova','D','Atalanta',9],
+  ['Dany Mota','A','Monza',9],
+  ['Ruben Loftus-Cheek','C','Milan',9],
+  ['Benjamin Pavard','D','Inter',9],
+  ['Mattia Felici','D','Cagliari',9],
+  ['Antonino Gallo','D','Lecce',9],
+  ['Filip Stankovic','P','Venezia',9],
+  ['M\'Bala Nzola','A','Fiorentina',9],
+  ['Mergim Vojvoda','D','Udinese',9],
+  ['Ardian Ismajli','D','Torino',9],
+  ['Nadir Zortea','D','Bologna',9],
+  ['Lassana Coulibaly','C','Lecce',9],
+  ['Emil Holm','D','Bologna',9],
+  ['Nikola Moro','C','Bologna',9],
+  ['Gvidas Gineitis','C','Torino',9],
+  ['Lorenzo Bernasconi','D','Atalanta',9],
+  ['Sam Beukema','D','Napoli',9],
+  ['Giorgi Kvernadze','A','Frosinone',9],
+  ['Gennaro Borrelli','A','Cagliari',9],
+  ['Aaron Martin','D','Genoa',9],
+  ['Lorenzo Lucca','A','Napoli',9],
+  ['Pietro Comuzzo','D','Torino',9],
+  ['Thomas Kristensen','D','Atalanta',9],
+  ['Nuno Tavares','D','Lazio',9],
+  ['Fisayo Dele-Bashiru','C','Lazio',9],
+  ['Jay Idzes','D','Sassuolo',9],
+  ['Alessandro Marcandalli','D','Genoa',9],
+  ['Honest Ahanor','D','Atalanta',9],
+  ['Devyne Rensch','D','Roma',9],
+  ['Luis Henrique de Lima','A','Inter',9],
+  ['Jakub Piotrowski','C','Udinese',9],
+  ['Ardon Jashari','C','Milan',9],
+  ['Arijanet Muric','P','Sassuolo',9],
+  ['Torbjorn Heggem','D','Bologna',9],
+  ['Andy Diouf','C','Inter',9],
+  ['Rafa Obrador','D','Sassuolo',9],
+  ['Elias Havel','A','Genoa',9],
+  ['Luis Manzanares Milla','C','Como',9],
+  ['Jay Robinson','C','Monza',9],
+];
+
+const DEFAULT_PLAYERS = DEFAULT_PLAYERS_RAW.map(([name, role, team, price]) => ({
+  id: `${name.toLowerCase()}-${role}-${team.toLowerCase()}`,
+  name,
+  role,
+  team,
+  price,
+}));
+
+const defaultTeams = () =>
+  Array.from({ length: 10 }, (_, i) => ({
+    id: i,
+    name: i === 0 ? "La mia squadra" : `Squadra ${i + 1}`,
+    players: [],
+  }));
+
+const defaultSettings = () => ({
+  budget: 750,
+  roster: { P: 3, D: 10, C: 10, A: 7 },
+});
+
+let orderCounter = 0;
+
+/* ---------- import parsing ---------- */
+
+function normRole(raw) {
+  const s = (raw || "").trim().toUpperCase();
+  if (ROLE_KEYS.includes(s)) return s;
+  if (s.startsWith("POR")) return "P";
+  if (s.startsWith("DIF") || s === "DC" || s === "DD" || s === "DS" || s === "E") return "D";
+  if (s.startsWith("CEN") || s === "M" || s === "W" || s === "T") return "C";
+  if (s.startsWith("ATT") || s === "PC") return "A";
+  return null;
+}
+
+function parseDatabase(text) {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const players = [];
+  for (const line of lines) {
+    const parts = line.split(/[;,\t]/).map((p) => p.trim());
+    if (parts.length < 2) continue;
+    const [name, roleRaw, team, priceRaw] = parts;
+    const role = normRole(roleRaw);
+    if (!name || !role) continue;
+    if (/^nome$/i.test(name)) continue; // skip header row
+    const price = parseInt((priceRaw || "").replace(/[^\d]/g, ""), 10);
+    players.push({
+      id: `${name}-${role}-${team || ""}`.toLowerCase(),
+      name,
+      role,
+      team: team || "",
+      price: isNaN(price) ? null : price,
+    });
+  }
+  return players;
+}
+
+/* ---------- component ---------- */
+
+function AstaFantacalcio() {
+  const [loaded, setLoaded] = useState(false);
+  const [saveError, setSaveError] = useState(false);
+  const [teams, setTeams] = useState(defaultTeams());
+  const [settings, setSettings] = useState(defaultSettings());
+  const [playerDB, setPlayerDB] = useState([]);
+  const [view, setView] = useState("board"); // board | quick | listone | log | setup
+  const [expandedTeam, setExpandedTeam] = useState(null);
+  const [form, setForm] = useState({ name: "", role: "D", teamId: 0, price: "" });
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [quickCallOpen, setQuickCallOpen] = useState(false);
+  const [quickCallInitial, setQuickCallInitial] = useState(null);
+  const [importText, setImportText] = useState("");
+  const [importMsg, setImportMsg] = useState("");
+
+  const [auctionId, setAuctionId] = useState(null);
+  const teamDbIdRef = useRef(new Map()); // slot -> uuid
+
+  const reloadTeams = useCallback(async (id) => {
+    const teamRows = await Db.getOrCreateTeams(id);
+    const assignmentRows = await Db.loadAssignments(id);
+    teamDbIdRef.current = new Map(teamRows.map((t) => [t.slot, t.id]));
+    setTeams(assembleTeams(teamRows, assignmentRows));
+    return assignmentRows;
+  }, []);
+
+  /* load */
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const auction = await Db.getOrCreateAuction();
+        if (cancelled) return;
+        setAuctionId(auction.id);
+        setSettings({ budget: auction.budget, roster: auction.roster });
+
+        const assignmentRows = await reloadTeams(auction.id);
+        orderCounter = assignmentRows.reduce((m, a) => Math.max(m, Number(a.seq) || 0), 0) + 1;
+
+        const playerRows = await Db.loadPlayers(auction.id);
+        if (playerRows.length) {
+          setPlayerDB(
+            playerRows.map((p) => ({
+              id: `${p.name}-${p.role}-${p.team || ""}`.toLowerCase(),
+              name: p.name,
+              role: p.role,
+              team: p.team || "",
+              price: p.price,
+            }))
+          );
+        } else {
+          setPlayerDB(DEFAULT_PLAYERS);
+          await Db.replacePlayers(auction.id, DEFAULT_PLAYERS);
+        }
+        setSaveError(false);
+      } catch (e) {
+        console.error(e);
+        setSaveError(true);
+      } finally {
+        if (!cancelled) setLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadTeams]);
+
+  /* realtime: tieni sincronizzati tutti i dispositivi collegati alla stessa asta */
+  useEffect(() => {
+    if (!auctionId) return;
+    const onRemoteChange = () => {
+      reloadTeams(auctionId).catch(() => setSaveError(true));
+    };
+    const channel = sb
+      .channel(`asta-${auctionId}`)
+      .on("postgres_changes", { event: "*", schema: "fanta", table: "assignments", filter: `auction_id=eq.${auctionId}` }, onRemoteChange)
+      .on("postgres_changes", { event: "*", schema: "fanta", table: "teams", filter: `auction_id=eq.${auctionId}` }, onRemoteChange)
+      .on("postgres_changes", { event: "*", schema: "fanta", table: "auctions", filter: `id=eq.${auctionId}` }, (payload) => {
+        if (payload.new) setSettings({ budget: payload.new.budget, roster: payload.new.roster });
+      })
+      .subscribe();
+    return () => {
+      sb.removeChannel(channel);
+    };
+  }, [auctionId, reloadTeams]);
+
+  const updateSettings = (updater) => {
+    setSettings((prev) => {
+      const next = updater(prev);
+      Db.updateAuctionSettings(auctionId, next).catch(() => setSaveError(true));
+      return next;
+    });
+  };
+
+  /* derived */
+  const totals = useMemo(() => {
+    const totalSlots = 10 * Object.values(settings.roster).reduce((a, b) => a + b, 0);
+    const totalBudget = 10 * settings.budget;
+    let spent = 0;
+    let bought = 0;
+    teams.forEach((t) => {
+      t.players.forEach((p) => {
+        spent += p.price;
+        bought += 1;
+      });
+    });
+    return { totalSlots, totalBudget, spent, bought, remaining: totalBudget - spent, slotsLeft: totalSlots - bought };
+  }, [teams, settings]);
+
+  const teamStats = useCallback(
+    (team) => {
+      const spent = team.players.reduce((s, p) => s + p.price, 0);
+      const remaining = settings.budget - spent;
+      const roleCounts = { P: 0, D: 0, C: 0, A: 0 };
+      team.players.forEach((p) => (roleCounts[p.role] += 1));
+      const slotsTotal = Object.values(settings.roster).reduce((a, b) => a + b, 0);
+      const slotsUsed = team.players.length;
+      return { spent, remaining, roleCounts, slotsUsed, slotsTotal };
+    },
+    [settings]
+  );
+
+  const allLog = useMemo(() => {
+    return teams
+      .flatMap((t) => t.players.map((p) => ({ ...p, teamName: t.name, teamId: t.id })))
+      .sort((a, b) => b.order - a.order);
+  }, [teams]);
+
+  const soldMap = useMemo(() => {
+    const m = new Map();
+    teams.forEach((t) => {
+      t.players.forEach((p) => {
+        m.set(`${p.name.toLowerCase()}|${p.role}`, { teamName: t.name, price: p.price });
+      });
+    });
+    return m;
+  }, [teams]);
+
+  /* actions */
+  const addPlayer = (overrides) => {
+    const name = (overrides?.name ?? form.name).trim();
+    const role = overrides?.role ?? form.role;
+    const teamId = overrides?.teamId ?? form.teamId;
+    const priceRaw = overrides?.price ?? form.price;
+    const price = parseInt(priceRaw, 10);
+    if (!name || isNaN(price) || price < 0) return false;
+    const team = teams.find((t) => t.id === teamId);
+    if (!team) return false;
+    const stats = teamStats(team);
+    if (stats.roleCounts[role] >= settings.roster[role]) {
+      if (!window.confirm(`${team.name} ha già raggiunto il limite per il ruolo ${role}. Aggiungere comunque?`)) return false;
+    }
+    if (price > stats.remaining) {
+      if (!window.confirm(`${team.name} non ha abbastanza crediti rimanenti (${stats.remaining}). Registrare comunque?`)) return false;
+    }
+    const teamDbId = teamDbIdRef.current.get(teamId);
+    if (!teamDbId) return false;
+    (async () => {
+      try {
+        const row = await Db.insertAssignment(auctionId, teamDbId, name, role, price);
+        const entry = { id: row.id, name: row.player_name, role: row.role, price: row.price, order: Number(row.seq) };
+        orderCounter = Math.max(orderCounter, entry.order + 1);
+        setTeams((prev) => prev.map((t) => (t.id === teamId ? { ...t, players: [...t.players, entry] } : t)));
+      } catch (e) {
+        if (e.code === "23505") {
+          window.alert(`${name} è già stato assegnato in questa asta.`);
+        } else {
+          setSaveError(true);
+        }
+      }
+    })();
+    setForm({ name: "", role, teamId, price: "" });
+    return true;
+  };
+
+  const removePlayer = (teamId, playerId) => {
+    setTeams((prev) =>
+      prev.map((t) => (t.id === teamId ? { ...t, players: t.players.filter((p) => p.id !== playerId) } : t))
+    );
+    Db.deleteAssignment(playerId).catch(() => setSaveError(true));
+  };
+
+  const renameTeam = (teamId, name) => {
+    setTeams((prev) => prev.map((t) => (t.id === teamId ? { ...t, name } : t)));
+    const dbId = teamDbIdRef.current.get(teamId);
+    if (dbId) Db.renameTeam(dbId, name).catch(() => setSaveError(true));
+  };
+
+  const clearAll = () => {
+    const fresh = defaultTeams();
+    orderCounter = 0;
+    setTeams(fresh);
+    setConfirmClear(false);
+    (async () => {
+      try {
+        await Db.clearAssignments(auctionId);
+        await Db.resetTeamNames(auctionId, teamDbIdRef.current);
+      } catch (e) {
+        setSaveError(true);
+      }
+    })();
+  };
+
+  const doImport = () => {
+    const parsed = parseDatabase(importText);
+    if (parsed.length === 0) {
+      setImportMsg("Nessun giocatore riconosciuto. Controlla il formato.");
+      return;
+    }
+    setPlayerDB(parsed);
+    Db.replacePlayers(auctionId, parsed).catch(() => setSaveError(true));
+    setImportText("");
+    setImportMsg(`Importati ${parsed.length} giocatori.`);
+  };
+
+  const resetDB = () => {
+    setPlayerDB(DEFAULT_PLAYERS);
+    Db.replacePlayers(auctionId, DEFAULT_PLAYERS).catch(() => setSaveError(true));
+    setImportMsg(`Listone ripristinato (${DEFAULT_PLAYERS.length} giocatori).`);
+  };
+
+  const clearDB = async () => {
+    setPlayerDB([]);
+    setImportMsg("Listone svuotato.");
+    try {
+      await Db.replacePlayers(auctionId, []);
+    } catch (e) {
+      setSaveError(true);
+    }
+  };
+
+  const pickFromListone = (p) => {
+    setQuickCallInitial({ name: p.name, role: p.role, price: p.price });
+    setQuickCallOpen(true);
+  };
+
+  if (!loaded) {
+    return (
+      <div style={{ background: BG }} className="min-h-screen flex items-center justify-center">
+        <div style={{ color: CREAM }} className="font-medium tracking-wide">Caricamento asta…</div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ background: BG }} className="min-h-screen pb-24">
+      <style>{FONT_IMPORT}</style>
+
+      <Header totals={totals} saveError={saveError} />
+
+      <nav className="sticky top-0 z-20 flex gap-1 px-3 pt-2 pb-2 overflow-x-auto" style={{ background: BG }}>
+        {[
+          ["board", "Squadre"],
+          ["quick", "Vista rapida"],
+          ["listone", `Listone${playerDB.length ? ` (${playerDB.length})` : ""}`],
+          ["log", "Registro"],
+          ["setup", "Impostazioni"],
+        ].map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => setView(key)}
+            className="flex-1 py-2 rounded-lg text-xs font-semibold tracking-wide transition-colors whitespace-nowrap px-2"
+            style={{
+              background: view === key ? GOLD : "rgba(243,239,228,0.08)",
+              color: view === key ? BG : CREAM,
+              fontFamily: DISPLAY_FONT,
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      {view === "board" && (
+        <Board
+          teams={teams}
+          settings={settings}
+          teamStats={teamStats}
+          expandedTeam={expandedTeam}
+          setExpandedTeam={setExpandedTeam}
+          removePlayer={removePlayer}
+        />
+      )}
+
+      {view === "quick" && <QuickView teams={teams} settings={settings} teamStats={teamStats} />}
+
+      {view === "log" && <LogView log={allLog} removePlayer={removePlayer} />}
+
+      {view === "listone" && (
+        <ListoneView playerDB={playerDB} soldMap={soldMap} onPick={pickFromListone} />
+      )}
+
+      {view === "setup" && (
+        <SetupView
+          teams={teams}
+          settings={settings}
+          renameTeam={renameTeam}
+          updateSettings={updateSettings}
+          confirmClear={confirmClear}
+          setConfirmClear={setConfirmClear}
+          clearAll={clearAll}
+          importText={importText}
+          setImportText={setImportText}
+          doImport={doImport}
+          importMsg={importMsg}
+          playerDB={playerDB}
+          clearDB={clearDB}
+          resetDB={resetDB}
+        />
+      )}
+
+      {view !== "setup" && (
+        <QuickCallBar
+          onOpen={() => {
+            setQuickCallInitial(null);
+            setQuickCallOpen(true);
+          }}
+        />
+      )}
+
+      {quickCallOpen && (
+        <QuickCallModal
+          teams={teams}
+          settings={settings}
+          teamStats={teamStats}
+          playerDB={playerDB}
+          soldMap={soldMap}
+          addPlayer={addPlayer}
+          initial={quickCallInitial}
+          onClose={() => setQuickCallOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ---------- sub-components ---------- */
+
+function Header({ totals, saveError }) {
+  return (
+    <div className="px-4 pt-5 pb-3" style={{ borderBottom: "1px solid rgba(243,239,228,0.12)" }}>
+      <div className="flex items-baseline justify-between">
+        <h1
+          className="text-2xl tracking-wide"
+          style={{ color: CREAM, fontFamily: DISPLAY_FONT, letterSpacing: "0.02em", fontWeight: 700 }}
+        >
+          Asta Fantacalcio
+        </h1>
+        {saveError && <span className="text-xs" style={{ color: DANGER }}>salvataggio non riuscito</span>}
+      </div>
+      <div className="mt-3 grid grid-cols-3 gap-2">
+        <Stat label="Speso" value={totals.spent} accent={GOLD} />
+        <Stat label="Rimasto" value={totals.remaining} accent={CREAM} />
+        <Stat label="Slot liberi" value={totals.slotsLeft} accent="#8FBFAE" suffix={`/${totals.totalSlots}`} />
+      </div>
+    </div>
+  );
+}
+
+function Stat({ label, value, accent, suffix }) {
+  return (
+    <div className="rounded-lg px-2 py-2" style={{ background: "rgba(243,239,228,0.06)" }}>
+      <div className="text-[10px] uppercase tracking-wider" style={{ color: "rgba(243,239,228,0.55)" }}>
+        {label}
+      </div>
+      <div className="text-lg font-bold tabular-nums" style={{ color: accent, fontFamily: MONO_FONT }}>
+        {value}
+        {suffix ? <span className="text-xs font-normal" style={{ color: "rgba(243,239,228,0.5)" }}>{suffix}</span> : null}
+      </div>
+    </div>
+  );
+}
+
+/* Piano crediti per "La mia squadra" (id 0), basato sulla strategia 4-3-3 discussa:
+   1 big da 300+ in attacco, centrocampo/difesa alleggeriti sui riempitivi. */
+const MY_TEAM_PLAN = {
+  P: [27, 9, 9],
+  D: [20, 20, 20, 20, 10, 10, 5, 5, 5, 5],
+  C: [24, 23, 23, 8, 8, 8, 5, 5, 5, 5],
+  A: [300, 65, 45, 45, 5, 5, 5],
+};
+
+function nextTarget(role, usedCount) {
+  const plan = MY_TEAM_PLAN[role];
+  if (!plan || usedCount >= plan.length) return null;
+  return plan[usedCount];
+}
+
+function QuickView({ teams, settings, teamStats }) {
+  const [mode, setMode] = useState("riepilogo");
+  const rows = teams.map((t) => ({ team: t, stats: teamStats(t) }));
+
+  return (
+    <div className="px-3 mt-1 pb-4">
+      <div className="flex gap-1.5 mb-2">
+        {[
+          ["riepilogo", "Riepilogo"],
+          ["griglia", "Griglia"],
+        ].map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => setMode(key)}
+            className="text-xs font-semibold px-3 py-1.5 rounded-lg"
+            style={{
+              background: mode === key ? GOLD : "rgba(243,239,228,0.08)",
+              color: mode === key ? BG : CREAM,
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {mode === "riepilogo" ? (
+        <>
+          <div className="rounded-xl overflow-hidden" style={{ background: CARD_BG }}>
+            <div
+              className="grid text-[10px] font-semibold uppercase tracking-wider px-2 py-2"
+              style={{ gridTemplateColumns: "1.4fr 0.7fr 0.5fr 0.5fr 0.5fr 0.5fr", color: "rgba(243,239,228,0.5)", borderBottom: "1px solid rgba(243,239,228,0.1)" }}
+            >
+              <span>Squadra</span>
+              <span className="text-right">Rimasto</span>
+              <span className="text-center">P</span>
+              <span className="text-center">D</span>
+              <span className="text-center">C</span>
+              <span className="text-center">A</span>
+            </div>
+            {rows.map(({ team, stats }) => {
+              const over = stats.remaining < 0;
+              return (
+                <div
+                  key={team.id}
+                  className="grid items-center px-2 py-2 text-sm"
+                  style={{ gridTemplateColumns: "1.4fr 0.7fr 0.5fr 0.5fr 0.5fr 0.5fr", borderBottom: "1px solid rgba(243,239,228,0.06)" }}
+                >
+                  <span className="truncate pr-1" style={{ color: CREAM }}>
+                    {team.name}
+                  </span>
+                  <span
+                    className="text-right font-bold tabular-nums"
+                    style={{ color: over ? DANGER : GOLD, fontFamily: MONO_FONT }}
+                  >
+                    {stats.remaining}
+                  </span>
+                  {ROLE_KEYS.map((k) => (
+                    <span key={k} className="text-center tabular-nums text-xs" style={{ color: "rgba(243,239,228,0.75)" }}>
+                      {stats.roleCounts[k]}/{settings.roster[k]}
+                    </span>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+          <div className="text-[11px] mt-2" style={{ color: "rgba(243,239,228,0.4)" }}>
+            Budget per squadra: {settings.budget} crediti
+          </div>
+        </>
+      ) : (
+        <GridView teams={teams} teamStats={teamStats} />
+      )}
+    </div>
+  );
+}
+
+function GridView({ teams, teamStats }) {
+  return (
+    <div className="overflow-x-auto -mx-3 px-3">
+      <div className="flex gap-2" style={{ width: "max-content" }}>
+        {teams.map((team) => {
+          const stats = teamStats(team);
+          const sorted = [...team.players].sort((a, b) => {
+            if (a.role !== b.role) return ROLE_KEYS.indexOf(a.role) - ROLE_KEYS.indexOf(b.role);
+            return b.price - a.price;
+          });
+          return (
+            <div key={team.id} className="rounded-xl overflow-hidden shrink-0" style={{ background: CARD_BG, width: 148 }}>
+              <div className="px-2 py-2" style={{ borderBottom: "1px solid rgba(243,239,228,0.1)" }}>
+                <div className="text-xs font-semibold truncate" style={{ color: CREAM, fontFamily: DISPLAY_FONT }}>
+                  {team.name}
+                </div>
+                <div
+                  className="text-sm font-bold tabular-nums"
+                  style={{ color: stats.remaining < 0 ? DANGER : GOLD, fontFamily: MONO_FONT }}
+                >
+                  {stats.remaining} rim.
+                </div>
+              </div>
+              <div className="flex flex-col">
+                {sorted.length === 0 ? (
+                  <div className="text-[11px] px-2 py-3 text-center" style={{ color: "rgba(243,239,228,0.35)" }}>
+                    —
+                  </div>
+                ) : (
+                  sorted.map((p) => (
+                    <div
+                      key={p.id}
+                      className="flex items-center justify-between px-2 py-1.5 gap-1"
+                      style={{ borderBottom: "1px solid rgba(243,239,228,0.05)" }}
+                    >
+                      <span className="flex items-center gap-1 min-w-0">
+                        <span
+                          className="text-[9px] font-bold w-4 h-4 flex items-center justify-center rounded shrink-0"
+                          style={{ background: roleColor(p.role) + "26", color: roleColor(p.role) }}
+                        >
+                          {p.role}
+                        </span>
+                        <span className="text-[11px] truncate" style={{ color: CREAM }}>
+                          {p.name}
+                        </span>
+                      </span>
+                      <span className="text-[11px] font-semibold tabular-nums shrink-0" style={{ color: GOLD, fontFamily: MONO_FONT }}>
+                        {p.price}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function Board({ teams, settings, teamStats, expandedTeam, setExpandedTeam, removePlayer }) {
+  return (
+    <div className="px-3 flex flex-col gap-2 mt-1">
+      {teams.map((team) => {
+        const stats = teamStats(team);
+        const isOpen = expandedTeam === team.id;
+        const over = stats.remaining < 0;
+        return (
+          <div key={team.id} className="rounded-xl overflow-hidden" style={{ background: CARD_BG }}>
+            <button
+              onClick={() => setExpandedTeam(isOpen ? null : team.id)}
+              className="w-full px-3 py-3 flex items-center justify-between text-left"
+            >
+              <div className="flex-1 min-w-0">
+                <div className="font-semibold truncate" style={{ color: CREAM, fontFamily: DISPLAY_FONT, fontSize: "1.05rem" }}>
+                  {team.name}
+                </div>
+                <div className="flex gap-2 mt-1 flex-wrap">
+                  {ROLES.map((r) => {
+                    const target = team.id === 0 ? nextTarget(r.key, stats.roleCounts[r.key]) : null;
+                    return (
+                      <span
+                        key={r.key}
+                        className="text-[10px] font-semibold px-1.5 py-0.5 rounded"
+                        style={{ background: r.color + "26", color: r.color }}
+                      >
+                        {r.key} {stats.roleCounts[r.key]}/{settings.roster[r.key]}
+                        {target != null && <span style={{ opacity: 0.85 }}> ({target}cr)</span>}
+                      </span>
+                    );
+                  })}
+                </div>
+              </div>
+              <div className="text-right ml-2 shrink-0">
+                <div
+                  className="font-bold tabular-nums text-lg"
+                  style={{ color: over ? DANGER : GOLD, fontFamily: MONO_FONT }}
+                >
+                  {stats.remaining}
+                </div>
+                <div className="text-[10px]" style={{ color: "rgba(243,239,228,0.5)" }}>
+                  di {settings.budget}
+                </div>
+              </div>
+            </button>
+
+            {isOpen && (
+              <div className="px-3 pb-3">
+                {team.players.length === 0 ? (
+                  <div className="text-sm py-2" style={{ color: "rgba(243,239,228,0.45)" }}>
+                    Nessun giocatore ancora.
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-1">
+                    {[...team.players]
+                      .sort((a, b) => b.order - a.order)
+                      .map((p) => (
+                        <div
+                          key={p.id}
+                          className="flex items-center justify-between rounded-lg px-2 py-1.5"
+                          style={{ background: "rgba(243,239,228,0.05)" }}
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span
+                              className="text-[10px] font-bold w-5 h-5 flex items-center justify-center rounded shrink-0"
+                              style={{ background: roleColor(p.role) + "26", color: roleColor(p.role) }}
+                            >
+                              {p.role}
+                            </span>
+                            <span className="text-sm truncate" style={{ color: CREAM }}>
+                              {p.name}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span className="text-sm font-semibold tabular-nums" style={{ color: GOLD, fontFamily: MONO_FONT }}>
+                              {p.price}
+                            </span>
+                            <button
+                              onClick={() => removePlayer(team.id, p.id)}
+                              className="text-xs px-1.5 py-0.5 rounded"
+                              style={{ color: DANGER }}
+                              aria-label={`Rimuovi ${p.name}`}
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function LogView({ log, removePlayer }) {
+  if (log.length === 0) {
+    return (
+      <div className="px-4 py-10 text-center" style={{ color: "rgba(243,239,228,0.5)" }}>
+        Ancora nessun giocatore registrato. Usa il pulsante in basso per iniziare.
+      </div>
+    );
+  }
+  return (
+    <div className="px-3 flex flex-col gap-1.5 mt-1">
+      {log.map((p) => (
+        <div key={p.id} className="flex items-center justify-between rounded-lg px-3 py-2" style={{ background: CARD_BG }}>
+          <div className="flex items-center gap-2 min-w-0">
+            <span
+              className="text-[10px] font-bold w-5 h-5 flex items-center justify-center rounded shrink-0"
+              style={{ background: roleColor(p.role) + "26", color: roleColor(p.role) }}
+            >
+              {p.role}
+            </span>
+            <div className="min-w-0">
+              <div className="text-sm truncate" style={{ color: CREAM }}>
+                {p.name}
+              </div>
+              <div className="text-[11px] truncate" style={{ color: "rgba(243,239,228,0.5)" }}>
+                {p.teamName}
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="text-sm font-semibold tabular-nums" style={{ color: GOLD, fontFamily: MONO_FONT }}>
+              {p.price}
+            </span>
+            <button
+              onClick={() => removePlayer(p.teamId, p.id)}
+              className="text-xs px-1.5 py-0.5 rounded"
+              style={{ color: DANGER }}
+              aria-label={`Rimuovi ${p.name}`}
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ListoneView({ playerDB, soldMap, onPick }) {
+  const [search, setSearch] = useState("");
+  const [roleFilter, setRoleFilter] = useState("ALL");
+  const [teamFilter, setTeamFilter] = useState("ALL");
+  const [onlyAvailable, setOnlyAvailable] = useState(true);
+  const [limit, setLimit] = useState(60);
+
+  const teamOptions = useMemo(() => {
+    const set = new Set(playerDB.map((p) => p.team).filter(Boolean));
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [playerDB]);
+
+  const filtered = useMemo(() => {
+    let list = playerDB;
+    if (roleFilter !== "ALL") list = list.filter((p) => p.role === roleFilter);
+    if (teamFilter !== "ALL") list = list.filter((p) => p.team === teamFilter);
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      list = list.filter((p) => p.name.toLowerCase().includes(q));
+    }
+    if (onlyAvailable) {
+      list = list.filter((p) => !soldMap.has(`${p.name.toLowerCase()}|${p.role}`));
+    }
+    return [...list].sort((a, b) => (b.price ?? 0) - (a.price ?? 0));
+  }, [playerDB, search, roleFilter, teamFilter, onlyAvailable, soldMap]);
+
+  useEffect(() => {
+    setLimit(60);
+  }, [search, roleFilter, teamFilter, onlyAvailable]);
+
+  if (playerDB.length === 0) {
+    return (
+      <div className="px-4 py-10 text-center" style={{ color: "rgba(243,239,228,0.5)" }}>
+        Nessun listone caricato. Vai in Impostazioni → "Carica listone" per importare i giocatori.
+      </div>
+    );
+  }
+
+  const visible = filtered.slice(0, limit);
+
+  return (
+    <div className="px-3 mt-1 flex flex-col gap-2 pb-4">
+      <input
+        placeholder="Cerca giocatore…"
+        value={search}
+        onChange={(e) => setSearch(e.target.value)}
+        className="w-full rounded-lg px-3 py-2 text-sm"
+        style={{ background: CARD_BG, color: CREAM, border: "1px solid rgba(243,239,228,0.14)" }}
+      />
+
+      <div className="flex gap-1.5 overflow-x-auto">
+        {[["ALL", "Tutti"], ...ROLES.map((r) => [r.key, r.label])].map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => setRoleFilter(key)}
+            className="text-xs font-semibold px-2.5 py-1.5 rounded-lg whitespace-nowrap"
+            style={{
+              background: roleFilter === key ? (key === "ALL" ? GOLD : roleColor(key)) : "rgba(243,239,228,0.08)",
+              color: roleFilter === key ? BG : CREAM,
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex gap-2 items-center">
+        <select
+          value={teamFilter}
+          onChange={(e) => setTeamFilter(e.target.value)}
+          className="flex-1 rounded-lg px-2 py-1.5 text-xs"
+          style={{ background: CARD_BG, color: CREAM, border: "1px solid rgba(243,239,228,0.14)" }}
+        >
+          <option value="ALL">Tutte le squadre</option>
+          {teamOptions.map((t) => (
+            <option key={t} value={t}>
+              {t}
+            </option>
+          ))}
+        </select>
+        <button
+          onClick={() => setOnlyAvailable((v) => !v)}
+          className="text-xs font-semibold px-2.5 py-1.5 rounded-lg whitespace-nowrap"
+          style={{
+            background: onlyAvailable ? GOLD : "rgba(243,239,228,0.08)",
+            color: onlyAvailable ? BG : CREAM,
+          }}
+        >
+          Solo liberi
+        </button>
+      </div>
+
+      <div className="text-[11px]" style={{ color: "rgba(243,239,228,0.4)" }}>
+        {filtered.length} giocatori
+      </div>
+
+      <div className="flex flex-col gap-1">
+        {visible.map((p) => {
+          const sold = soldMap.get(`${p.name.toLowerCase()}|${p.role}`);
+          return (
+            <button
+              key={p.id}
+              onClick={() => !sold && onPick(p)}
+              disabled={!!sold}
+              className="flex items-center justify-between rounded-lg px-3 py-2 text-left"
+              style={{ background: CARD_BG, opacity: sold ? 0.45 : 1 }}
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <span
+                  className="text-[10px] font-bold w-5 h-5 flex items-center justify-center rounded shrink-0"
+                  style={{ background: roleColor(p.role) + "26", color: roleColor(p.role) }}
+                >
+                  {p.role}
+                </span>
+                <div className="min-w-0">
+                  <div className="text-sm truncate" style={{ color: CREAM }}>
+                    {p.name}
+                  </div>
+                  <div className="text-[11px] truncate" style={{ color: "rgba(243,239,228,0.5)" }}>
+                    {sold ? `venduto a ${sold.teamName} · ${sold.price}cr` : p.team}
+                  </div>
+                </div>
+              </div>
+              <span className="text-sm font-semibold tabular-nums shrink-0 ml-2" style={{ color: GOLD, fontFamily: MONO_FONT }}>
+                {p.price ?? "—"}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
+      {filtered.length > visible.length && (
+        <button
+          onClick={() => setLimit((l) => l + 60)}
+          className="rounded-lg py-2 text-xs font-semibold"
+          style={{ background: "rgba(243,239,228,0.08)", color: CREAM }}
+        >
+          Mostra altri ({filtered.length - visible.length})
+        </button>
+      )}
+    </div>
+  );
+}
+
+function QuickCallBar({ onOpen }) {
+  return (
+    <div
+      className="fixed bottom-0 left-0 right-0 z-30 px-3 pt-2 pb-4"
+      style={{ background: "linear-gradient(to top, " + BG + " 60%, transparent)" }}
+    >
+      <button
+        onClick={onOpen}
+        className="w-full rounded-xl py-3 font-bold tracking-wide"
+        style={{ background: GOLD, color: BG, fontFamily: DISPLAY_FONT, fontSize: "1rem" }}
+      >
+        + Assegna giocatore
+      </button>
+    </div>
+  );
+}
+
+function QuickCallModal({ teams, settings, teamStats, playerDB, soldMap, addPlayer, initial, onClose }) {
+  const [name, setName] = useState(initial?.name || "");
+  const [role, setRole] = useState(initial?.role || "D");
+  const [teamId, setTeamId] = useState(0);
+  const [price, setPrice] = useState("");
+  const [locked, setLocked] = useState(!!initial?.name);
+  const priceRef = useRef(null);
+  const nameRef = useRef(null);
+
+  useEffect(() => {
+    if (locked) priceRef.current?.focus();
+    else nameRef.current?.focus();
+  }, [locked]);
+
+  const suggestions = useMemo(() => {
+    if (locked || !name.trim()) return [];
+    const q = name.trim().toLowerCase();
+    return playerDB
+      .filter((p) => p.name.toLowerCase().includes(q) && !soldMap.has(`${p.name.toLowerCase()}|${p.role}`))
+      .slice(0, 6);
+  }, [name, playerDB, soldMap, locked]);
+
+  const quota = useMemo(() => {
+    const hit = playerDB.find((p) => p.name.toLowerCase() === name.trim().toLowerCase() && p.role === role);
+    return hit?.price ?? null;
+  }, [name, role, playerDB]);
+
+  const selectedTeam = teams.find((t) => t.id === teamId);
+  const stats = selectedTeam ? teamStats(selectedTeam) : null;
+  const target = teamId === 0 && stats ? nextTarget(role, stats.roleCounts[role]) : null;
+
+  const submit = () => {
+    const ok = addPlayer({ name, role, teamId, price });
+    if (ok) onClose();
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-40 flex items-end justify-center"
+      style={{ background: "rgba(0,0,0,0.55)" }}
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-md rounded-t-2xl px-4 pt-4 pb-6 flex flex-col gap-3"
+        style={{ background: CARD_BG, maxHeight: "92vh", overflowY: "auto" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between">
+          <div className="font-bold text-lg" style={{ color: CREAM, fontFamily: DISPLAY_FONT }}>
+            Assegna giocatore
+          </div>
+          <button onClick={onClose} className="text-sm px-2 py-1" style={{ color: "rgba(243,239,228,0.6)" }}>
+            Chiudi
+          </button>
+        </div>
+
+        <div className="relative">
+          <input
+            ref={nameRef}
+            placeholder="Nome giocatore"
+            value={name}
+            onChange={(e) => {
+              setName(e.target.value);
+              setLocked(false);
+            }}
+            className="w-full rounded-lg px-3 py-2.5 text-sm"
+            style={{ background: "rgba(243,239,228,0.07)", color: CREAM, border: "1px solid rgba(243,239,228,0.14)" }}
+          />
+          {suggestions.length > 0 && (
+            <div
+              className="absolute left-0 right-0 top-full mt-1 rounded-lg overflow-hidden z-10"
+              style={{ background: "#1B5A46", border: "1px solid rgba(243,239,228,0.14)" }}
+            >
+              {suggestions.map((p) => (
+                <button
+                  key={p.id}
+                  onClick={() => {
+                    setName(p.name);
+                    setRole(p.role);
+                    setLocked(true);
+                  }}
+                  className="w-full flex items-center justify-between px-3 py-2 text-left"
+                >
+                  <span className="flex items-center gap-2 min-w-0">
+                    <span
+                      className="text-[10px] font-bold w-5 h-5 flex items-center justify-center rounded shrink-0"
+                      style={{ background: roleColor(p.role) + "26", color: roleColor(p.role) }}
+                    >
+                      {p.role}
+                    </span>
+                    <span className="text-sm truncate" style={{ color: CREAM }}>
+                      {p.name}
+                    </span>
+                    <span className="text-[11px] shrink-0" style={{ color: "rgba(243,239,228,0.45)" }}>
+                      {p.team}
+                    </span>
+                  </span>
+                  <span className="text-xs font-semibold tabular-nums" style={{ color: GOLD, fontFamily: MONO_FONT }}>
+                    {p.price ?? "—"}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="flex gap-1.5">
+          {ROLES.map((r) => (
+            <button
+              key={r.key}
+              onClick={() => setRole(r.key)}
+              className="flex-1 py-2 rounded-lg text-xs font-bold"
+              style={{
+                background: role === r.key ? r.color : "rgba(243,239,228,0.08)",
+                color: role === r.key ? BG : CREAM,
+              }}
+            >
+              {r.key}
+            </button>
+          ))}
+        </div>
+
+        <select
+          value={teamId}
+          onChange={(e) => setTeamId(parseInt(e.target.value, 10))}
+          className="w-full rounded-lg px-3 py-2.5 text-sm"
+          style={{ background: "rgba(243,239,228,0.07)", color: CREAM, border: "1px solid rgba(243,239,228,0.14)" }}
+        >
+          {teams.map((t) => {
+            const s = teamStats(t);
+            return (
+              <option key={t.id} value={t.id}>
+                {t.name} — {s.remaining} cr
+              </option>
+            );
+          })}
+        </select>
+
+        <input
+          ref={priceRef}
+          type="number"
+          inputMode="numeric"
+          placeholder="Prezzo pagato"
+          value={price}
+          onChange={(e) => setPrice(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          className="w-full rounded-lg px-3 py-2.5 text-lg font-bold tabular-nums"
+          style={{
+            background: "rgba(243,239,228,0.07)",
+            color: GOLD,
+            fontFamily: MONO_FONT,
+            border: "1px solid rgba(243,239,228,0.14)",
+          }}
+        />
+
+        <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px]" style={{ color: "rgba(243,239,228,0.55)" }}>
+          {quota != null && <span>Quotazione: {quota} cr</span>}
+          {stats && (
+            <span>
+              {selectedTeam.name}: {stats.roleCounts[role]}/{settings.roster[role]} {role} · {stats.remaining} cr
+            </span>
+          )}
+          {target != null && <span style={{ color: GOLD }}>Piano: {target} cr</span>}
+        </div>
+
+        <button
+          onClick={submit}
+          disabled={!name.trim() || price === ""}
+          className="w-full rounded-xl py-3 font-bold"
+          style={{
+            background: !name.trim() || price === "" ? "rgba(243,239,228,0.15)" : GOLD,
+            color: !name.trim() || price === "" ? "rgba(243,239,228,0.4)" : BG,
+            fontFamily: DISPLAY_FONT,
+          }}
+        >
+          Registra
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SetupView({
+  teams,
+  settings,
+  renameTeam,
+  updateSettings,
+  confirmClear,
+  setConfirmClear,
+  clearAll,
+  importText,
+  setImportText,
+  doImport,
+  importMsg,
+  playerDB,
+  clearDB,
+  resetDB,
+}) {
+  const inputStyle = {
+    background: "rgba(243,239,228,0.07)",
+    color: CREAM,
+    border: "1px solid rgba(243,239,228,0.14)",
+  };
+  const sectionTitle = { color: CREAM, fontFamily: DISPLAY_FONT };
+
+  return (
+    <div className="px-3 mt-1 flex flex-col gap-3 pb-10">
+      <div className="rounded-xl p-3" style={{ background: CARD_BG }}>
+        <div className="font-semibold mb-2" style={sectionTitle}>
+          Squadre
+        </div>
+        <div className="flex flex-col gap-1.5">
+          {teams.map((t) => (
+            <input
+              key={t.id}
+              value={t.name}
+              onChange={(e) => renameTeam(t.id, e.target.value)}
+              className="w-full rounded-lg px-3 py-2 text-sm"
+              style={inputStyle}
+            />
+          ))}
+        </div>
+      </div>
+
+      <div className="rounded-xl p-3" style={{ background: CARD_BG }}>
+        <div className="font-semibold mb-2" style={sectionTitle}>
+          Budget e rosa
+        </div>
+        <label className="block text-[11px] mb-1" style={{ color: "rgba(243,239,228,0.55)" }}>
+          Crediti per squadra
+        </label>
+        <input
+          type="number"
+          inputMode="numeric"
+          value={settings.budget}
+          onChange={(e) => {
+            const v = parseInt(e.target.value, 10);
+            updateSettings((s) => ({ ...s, budget: isNaN(v) ? 0 : v }));
+          }}
+          className="w-full rounded-lg px-3 py-2 text-sm tabular-nums mb-3"
+          style={{ ...inputStyle, fontFamily: MONO_FONT }}
+        />
+        <div className="grid grid-cols-4 gap-2">
+          {ROLES.map((r) => (
+            <div key={r.key}>
+              <label className="block text-[11px] mb-1" style={{ color: r.color }}>
+                {r.key}
+              </label>
+              <input
+                type="number"
+                inputMode="numeric"
+                value={settings.roster[r.key]}
+                onChange={(e) => {
+                  const v = parseInt(e.target.value, 10);
+                  updateSettings((s) => ({
+                    ...s,
+                    roster: { ...s.roster, [r.key]: isNaN(v) ? 0 : v },
+                  }));
+                }}
+                className="w-full rounded-lg px-2 py-2 text-sm tabular-nums"
+                style={{ ...inputStyle, fontFamily: MONO_FONT }}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="rounded-xl p-3" style={{ background: CARD_BG }}>
+        <div className="font-semibold mb-1" style={sectionTitle}>
+          Carica listone
+        </div>
+        <div className="text-[11px] mb-2" style={{ color: "rgba(243,239,228,0.5)" }}>
+          Una riga per giocatore: <span style={{ fontFamily: MONO_FONT }}>Nome;Ruolo;Squadra;Quotazione</span> —
+          separatori ammessi: <span style={{ fontFamily: MONO_FONT }}>; , tab</span>. Sostituisce il listone attuale
+          ({playerDB.length} giocatori).
+        </div>
+        <textarea
+          value={importText}
+          onChange={(e) => setImportText(e.target.value)}
+          rows={5}
+          placeholder={"Lautaro Martinez;A;Inter;55\nBastoni;D;Inter;21"}
+          className="w-full rounded-lg px-3 py-2 text-xs"
+          style={{ ...inputStyle, fontFamily: MONO_FONT }}
+        />
+        <div className="flex gap-2 mt-2">
+          <button
+            onClick={doImport}
+            className="flex-1 rounded-lg py-2 text-sm font-semibold"
+            style={{ background: GOLD, color: BG }}
+          >
+            Importa
+          </button>
+          <button
+            onClick={resetDB}
+            className="rounded-lg px-3 py-2 text-sm font-semibold"
+            style={{ background: "rgba(243,239,228,0.08)", color: CREAM }}
+          >
+            Ripristina
+          </button>
+          <button
+            onClick={clearDB}
+            className="rounded-lg px-3 py-2 text-sm font-semibold"
+            style={{ background: "rgba(243,239,228,0.08)", color: DANGER }}
+          >
+            Svuota
+          </button>
+        </div>
+        {importMsg && (
+          <div className="text-[11px] mt-2" style={{ color: GOLD }}>
+            {importMsg}
+          </div>
+        )}
+      </div>
+
+      <div className="rounded-xl p-3" style={{ background: CARD_BG }}>
+        <div className="font-semibold mb-2" style={sectionTitle}>
+          Azzera asta
+        </div>
+        <div className="text-[11px] mb-2" style={{ color: "rgba(243,239,228,0.5)" }}>
+          Cancella tutti i giocatori assegnati. Nomi squadre, budget e listone restano.
+        </div>
+        {confirmClear ? (
+          <div className="flex gap-2">
+            <button
+              onClick={clearAll}
+              className="flex-1 rounded-lg py-2 text-sm font-semibold"
+              style={{ background: DANGER, color: CREAM }}
+            >
+              Conferma azzeramento
+            </button>
+            <button
+              onClick={() => setConfirmClear(false)}
+              className="rounded-lg px-3 py-2 text-sm font-semibold"
+              style={{ background: "rgba(243,239,228,0.08)", color: CREAM }}
+            >
+              Annulla
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={() => setConfirmClear(true)}
+            className="w-full rounded-lg py-2 text-sm font-semibold"
+            style={{ background: "rgba(224,108,92,0.18)", color: DANGER }}
+          >
+            Azzera tutti i giocatori
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<AstaFantacalcio />);
+
+</script>
+</body>
+</html>
