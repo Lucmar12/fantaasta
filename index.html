@@ -1106,28 +1106,34 @@ function AstaFantacalcio() {
 
       <Header totals={totals} saveError={saveError} />
 
-      <nav className="sticky top-0 z-20 flex gap-1 px-3 pt-2 pb-2 overflow-x-auto" style={{ background: BG }}>
-        {[
-          ["board", "Squadre"],
-          ["quick", "Vista rapida"],
-          ["listone", `Listone${playerDB.length ? ` (${playerDB.length})` : ""}`],
-          ["log", "Registro"],
-          ["setup", "Impostazioni"],
-        ].map(([key, label]) => (
-          <button
-            key={key}
-            onClick={() => setView(key)}
-            className="flex-1 py-2 rounded-lg text-xs font-semibold tracking-wide transition-colors whitespace-nowrap px-2"
-            style={{
-              background: view === key ? GOLD : "rgba(243,239,228,0.08)",
-              color: view === key ? BG : CREAM,
-              fontFamily: DISPLAY_FONT,
-            }}
-          >
-            {label}
-          </button>
-        ))}
-      </nav>
+      <div className="sticky top-0 z-20 relative" style={{ background: BG }}>
+        <nav className="flex gap-1 px-3 pt-2 pb-2 overflow-x-auto">
+          {[
+            ["board", "Squadre"],
+            ["quick", "Vista rapida"],
+            ["listone", `Listone${playerDB.length ? ` (${playerDB.length})` : ""}`],
+            ["log", "Registro"],
+            ["setup", "Impostazioni"],
+          ].map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setView(key)}
+              className="flex-1 py-2 rounded-lg text-xs font-semibold tracking-wide transition-colors whitespace-nowrap px-2"
+              style={{
+                background: view === key ? GOLD : "rgba(243,239,228,0.08)",
+                color: view === key ? BG : CREAM,
+                fontFamily: DISPLAY_FONT,
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+        <div
+          className="pointer-events-none absolute top-0 right-0 h-full w-8"
+          style={{ background: `linear-gradient(to right, transparent, ${BG})` }}
+        />
+      </div>
 
       {view === "board" && (
         <Board
@@ -1593,20 +1599,26 @@ function ListoneView({ playerDB, soldMap, onPick, addManualPlayer, editManualPla
         </div>
       )}
 
-      <div className="flex gap-1.5 overflow-x-auto">
-        {[["ALL", "Tutti"], ...ROLES.map((r) => [r.key, r.label])].map(([key, label]) => (
-          <button
-            key={key}
-            onClick={() => setRoleFilter(key)}
-            className="text-xs font-semibold px-2.5 py-1.5 rounded-lg whitespace-nowrap"
-            style={{
-              background: roleFilter === key ? (key === "ALL" ? GOLD : roleColor(key)) : "rgba(243,239,228,0.08)",
-              color: roleFilter === key ? BG : CREAM,
-            }}
-          >
-            {label}
-          </button>
-        ))}
+      <div className="relative">
+        <div className="flex gap-1.5 overflow-x-auto">
+          {[["ALL", "Tutti"], ...ROLES.map((r) => [r.key, r.label])].map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setRoleFilter(key)}
+              className="text-xs font-semibold px-2.5 py-1.5 rounded-lg whitespace-nowrap"
+              style={{
+                background: roleFilter === key ? (key === "ALL" ? GOLD : roleColor(key)) : "rgba(243,239,228,0.08)",
+                color: roleFilter === key ? BG : CREAM,
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <div
+          className="pointer-events-none absolute top-0 right-0 h-full w-8"
+          style={{ background: `linear-gradient(to right, transparent, ${BG})` }}
+        />
       </div>
 
       <div className="flex gap-2 items-center">
