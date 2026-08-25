@@ -177,6 +177,32 @@ function dbRowToPlayer(p) {
   return { id: p.id, dbId: p.id, name: p.name, role: p.role, team: p.team || "", price: p.price };
 }
 
+function localPlayer(p) {
+  const id = `pending-${p.name}-${p.role}-${Math.random().toString(36).slice(2)}`;
+  return { id, dbId: id, name: p.name, role: p.role, team: p.team || "", price: p.price };
+}
+
+/* ---------- cache offline ----------
+   Ultima copia nota dello stato, così l'app resta usabile (e le modifiche
+   restano visibili) anche senza connessione; viene sincronizzata con
+   Supabase non appena la rete torna disponibile. */
+const OFFLINE_CACHE_KEY = "fanta-asta-cache-v1";
+
+function saveOfflineCache(snapshot) {
+  try {
+    localStorage.setItem(OFFLINE_CACHE_KEY, JSON.stringify(snapshot));
+  } catch (e) {}
+}
+
+function loadOfflineCache() {
+  try {
+    const raw = localStorage.getItem(OFFLINE_CACHE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 function assembleTeams(teamRows, assignmentRows) {
   const byTeamDbId = new Map(teamRows.map((t) => [t.id, []]));
   assignmentRows.forEach((a) => {
@@ -795,9 +821,62 @@ function AstaFantacalcio() {
   const [importMsg, setImportMsg] = useState("");
 
   const [auctionId, setAuctionId] = useState(null);
+  const [offline, setOffline] = useState(false);
+  const [pendingCount, setPendingCount] = useState(0);
   const teamDbIdRef = useRef(new Map()); // slot -> uuid
   const reloadSeqRef = useRef(0);
   const renameTimersRef = useRef(new Map()); // slot -> timeout id
+  const pendingRef = useRef([]); // [{id, tag, run}]
+  const flushingRef = useRef(false);
+
+  const queueRetry = useCallback((run, tag) => {
+    pendingRef.current.push({ id: `${Date.now()}-${Math.random()}`, tag, run });
+    setPendingCount(pendingRef.current.length);
+    setSaveError(true);
+  }, []);
+
+  const cancelPending = useCallback((tag) => {
+    pendingRef.current = pendingRef.current.filter((item) => item.tag !== tag);
+    setPendingCount(pendingRef.current.length);
+  }, []);
+
+  const flushPending = useCallback(async () => {
+    if (flushingRef.current || !pendingRef.current.length) return;
+    if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+    flushingRef.current = true;
+    const items = pendingRef.current;
+    const stillPending = [];
+    for (const item of items) {
+      try {
+        await item.run();
+      } catch (e) {
+        stillPending.push(item);
+      }
+    }
+    pendingRef.current = stillPending;
+    setPendingCount(stillPending.length);
+    setSaveError(stillPending.length > 0);
+    flushingRef.current = false;
+  }, []);
+
+  useEffect(() => {
+    const updateOnlineState = () => setOffline(!navigator.onLine);
+    updateOnlineState();
+    const onReconnect = () => {
+      flushPending();
+      if (auctionId) reloadTeams(auctionId).catch(() => {});
+    };
+    window.addEventListener("online", updateOnlineState);
+    window.addEventListener("offline", updateOnlineState);
+    window.addEventListener("online", onReconnect);
+    const interval = setInterval(flushPending, 5000);
+    return () => {
+      window.removeEventListener("online", updateOnlineState);
+      window.removeEventListener("offline", updateOnlineState);
+      window.removeEventListener("online", onReconnect);
+      clearInterval(interval);
+    };
+  }, [flushPending, auctionId]);
 
   const reloadTeams = useCallback(async (id) => {
     const seq = ++reloadSeqRef.current;
@@ -832,6 +911,17 @@ function AstaFantacalcio() {
         setSaveError(false);
       } catch (e) {
         console.error(e);
+        if (cancelled) return;
+        const cached = loadOfflineCache();
+        if (cached) {
+          setAuctionId(cached.auctionId);
+          setSettings(cached.settings);
+          setTeams(cached.teams);
+          setPlayerDB(cached.playerDB);
+          teamDbIdRef.current = new Map(cached.teamDbIds || []);
+          const maxOrder = cached.teams.flatMap((t) => t.players).reduce((m, p) => Math.max(m, p.order || 0), 0);
+          orderCounter = maxOrder + 1;
+        }
         setSaveError(true);
       } finally {
         if (!cancelled) setLoaded(true);
@@ -841,6 +931,19 @@ function AstaFantacalcio() {
       cancelled = true;
     };
   }, [reloadTeams]);
+
+  /* mantieni una copia locale sempre aggiornata: se la rete cade, ricaricando
+     la pagina l'app riparte comunque dall'ultimo stato noto */
+  useEffect(() => {
+    if (!loaded || !auctionId) return;
+    saveOfflineCache({
+      auctionId,
+      settings,
+      teams,
+      playerDB,
+      teamDbIds: Array.from(teamDbIdRef.current.entries()),
+    });
+  }, [loaded, auctionId, settings, teams, playerDB]);
 
   /* realtime: tieni sincronizzati tutti i dispositivi collegati alla stessa asta */
   useEffect(() => {
@@ -864,7 +967,8 @@ function AstaFantacalcio() {
   const updateSettings = (updater) => {
     setSettings((prev) => {
       const next = updater(prev);
-      Db.updateAuctionSettings(auctionId, next).catch(() => setSaveError(true));
+      const attempt = () => Db.updateAuctionSettings(auctionId, next);
+      attempt().catch(() => queueRetry(attempt, "settings"));
       return next;
     });
   };
@@ -932,21 +1036,34 @@ function AstaFantacalcio() {
     }
     const teamDbId = teamDbIdRef.current.get(teamId);
     if (!teamDbId) return false;
-    (async () => {
-      try {
-        const row = await Db.insertAssignment(auctionId, teamDbId, name, role, price);
-        const entry = { id: row.id, name: row.player_name, role: row.role, price: row.price, order: Number(row.seq) };
-        orderCounter = Math.max(orderCounter, entry.order + 1);
-        setTeams((prev) => prev.map((t) => (t.id === teamId ? { ...t, players: [...t.players, entry] } : t)));
-      } catch (e) {
-        if (e.code === "23505") {
-          window.alert(`${name} è già stato assegnato in questa asta.`);
-        } else {
-          setSaveError(true);
-        }
-      }
-    })();
+
+    const tempId = `pending-${Date.now()}-${Math.random()}`;
+    const localOrder = orderCounter++;
+    setTeams((prev) =>
+      prev.map((t) => (t.id === teamId ? { ...t, players: [...t.players, { id: tempId, name, role, price, order: localOrder }] } : t))
+    );
     setForm({ name: "", role, teamId, price: "" });
+
+    const attempt = async () => {
+      const row = await Db.insertAssignment(auctionId, teamDbId, name, role, price);
+      const entry = { id: row.id, name: row.player_name, role: row.role, price: row.price, order: Number(row.seq) };
+      orderCounter = Math.max(orderCounter, entry.order + 1);
+      setTeams((prev) =>
+        prev.map((t) =>
+          t.id === teamId ? { ...t, players: t.players.map((p) => (p.id === tempId ? entry : p)) } : t
+        )
+      );
+    };
+    attempt().catch((e) => {
+      if (e.code === "23505") {
+        window.alert(`${name} è già stato assegnato in questa asta.`);
+        setTeams((prev) =>
+          prev.map((t) => (t.id === teamId ? { ...t, players: t.players.filter((p) => p.id !== tempId) } : t))
+        );
+        return;
+      }
+      queueRetry(attempt, tempId);
+    });
     return true;
   };
 
@@ -954,23 +1071,25 @@ function AstaFantacalcio() {
     setTeams((prev) =>
       prev.map((t) => (t.id === teamId ? { ...t, players: t.players.filter((p) => p.id !== playerId) } : t))
     );
-    Db.deleteAssignment(playerId).catch(() => setSaveError(true));
+    if (String(playerId).startsWith("pending-")) {
+      cancelPending(playerId);
+      return;
+    }
+    const attempt = () => Db.deleteAssignment(playerId);
+    attempt().catch(() => queueRetry(attempt, playerId));
   };
 
   const renameTeam = (teamId, name) => {
     setDraftNames((prev) => ({ ...prev, [teamId]: name }));
     const existing = renameTimersRef.current.get(teamId);
     if (existing) clearTimeout(existing);
-    const timer = setTimeout(async () => {
+    const timer = setTimeout(() => {
       renameTimersRef.current.delete(teamId);
       const dbId = teamDbIdRef.current.get(teamId);
+      setTeams((prev) => prev.map((t) => (t.id === teamId ? { ...t, name } : t)));
       if (dbId) {
-        try {
-          await Db.renameTeam(dbId, name);
-          setTeams((prev) => prev.map((t) => (t.id === teamId ? { ...t, name } : t)));
-        } catch (e) {
-          setSaveError(true);
-        }
+        const attempt = () => Db.renameTeam(dbId, name);
+        attempt().catch(() => queueRetry(attempt, `rename-${teamId}`));
       }
       setDraftNames((prev) => {
         const next = { ...prev };
@@ -986,14 +1105,11 @@ function AstaFantacalcio() {
     orderCounter = 0;
     setTeams(fresh);
     setConfirmClear(false);
-    (async () => {
-      try {
-        await Db.clearAssignments(auctionId);
-        await Db.resetTeamNames(auctionId, teamDbIdRef.current);
-      } catch (e) {
-        setSaveError(true);
-      }
-    })();
+    const attempt = async () => {
+      await Db.clearAssignments(auctionId);
+      await Db.resetTeamNames(auctionId, teamDbIdRef.current);
+    };
+    attempt().catch(() => queueRetry(attempt, "clear-all"));
   };
 
   const doImport = () => {
@@ -1002,38 +1118,31 @@ function AstaFantacalcio() {
       setImportMsg("Nessun giocatore riconosciuto. Controlla il formato.");
       return;
     }
-    (async () => {
-      try {
-        const inserted = await Db.replacePlayers(auctionId, parsed);
-        setPlayerDB(inserted.map(dbRowToPlayer));
-        setImportText("");
-        setImportMsg(`Importati ${parsed.length} giocatori.`);
-      } catch (e) {
-        setSaveError(true);
-      }
-    })();
+    setPlayerDB(parsed.map(localPlayer));
+    setImportText("");
+    setImportMsg(`Importati ${parsed.length} giocatori.`);
+    const attempt = async () => {
+      const inserted = await Db.replacePlayers(auctionId, parsed);
+      setPlayerDB(inserted.map(dbRowToPlayer));
+    };
+    attempt().catch(() => queueRetry(attempt, "import-db"));
   };
 
   const resetDB = () => {
-    (async () => {
-      try {
-        const inserted = await Db.replacePlayers(auctionId, DEFAULT_PLAYERS);
-        setPlayerDB(inserted.map(dbRowToPlayer));
-        setImportMsg(`Listone ripristinato (${DEFAULT_PLAYERS.length} giocatori).`);
-      } catch (e) {
-        setSaveError(true);
-      }
-    })();
+    setPlayerDB(DEFAULT_PLAYERS.map(localPlayer));
+    setImportMsg(`Listone ripristinato (${DEFAULT_PLAYERS.length} giocatori).`);
+    const attempt = async () => {
+      const inserted = await Db.replacePlayers(auctionId, DEFAULT_PLAYERS);
+      setPlayerDB(inserted.map(dbRowToPlayer));
+    };
+    attempt().catch(() => queueRetry(attempt, "import-db"));
   };
 
-  const clearDB = async () => {
+  const clearDB = () => {
     setPlayerDB([]);
     setImportMsg("Listone svuotato.");
-    try {
-      await Db.replacePlayers(auctionId, []);
-    } catch (e) {
-      setSaveError(true);
-    }
+    const attempt = () => Db.replacePlayers(auctionId, []);
+    attempt().catch(() => queueRetry(attempt, "import-db"));
   };
 
   const addManualPlayer = async ({ name, role, team, price }) => {
@@ -1043,48 +1152,55 @@ function AstaFantacalcio() {
       window.alert("Compila nome, ruolo e prezzo (numero ≥ 0) prima di salvare.");
       return false;
     }
-    try {
-      const row = await Db.insertPlayer(auctionId, { name: cleanName, role, team: (team || "").trim(), price: cleanPrice });
-      setPlayerDB((prev) => [...prev, dbRowToPlayer(row)]);
-      return true;
-    } catch (e) {
+    const cleanTeam = (team || "").trim();
+    const tempId = `pending-${Date.now()}-${Math.random()}`;
+    setPlayerDB((prev) => [...prev, { id: tempId, dbId: tempId, name: cleanName, role, team: cleanTeam, price: cleanPrice }]);
+    const attempt = async () => {
+      const row = await Db.insertPlayer(auctionId, { name: cleanName, role, team: cleanTeam, price: cleanPrice });
+      setPlayerDB((prev) => prev.map((p) => (p.dbId === tempId ? dbRowToPlayer(row) : p)));
+    };
+    attempt().catch((e) => {
       if (e.code === "23505") {
         window.alert(`${cleanName} (${role}) è già nel listone.`);
-      } else {
-        setSaveError(true);
+        setPlayerDB((prev) => prev.filter((p) => p.dbId !== tempId));
+        return;
       }
-      return false;
-    }
+      queueRetry(attempt, tempId);
+    });
+    return true;
   };
 
-  const editManualPlayer = async (dbId, { name, role, team, price }) => {
+  const editManualPlayer = (dbId, { name, role, team, price }) => {
     const cleanName = (name || "").trim();
     const cleanPrice = parseInt(price, 10);
     if (!cleanName || !ROLE_KEYS.includes(role) || isNaN(cleanPrice) || cleanPrice < 0) {
       window.alert("Compila nome, ruolo e prezzo (numero ≥ 0) prima di salvare.");
       return false;
     }
-    try {
-      const row = await Db.updatePlayer(dbId, { name: cleanName, role, team: (team || "").trim(), price: cleanPrice });
+    const cleanTeam = (team || "").trim();
+    setPlayerDB((prev) => prev.map((p) => (p.dbId === dbId ? { ...p, name: cleanName, role, team: cleanTeam, price: cleanPrice } : p)));
+    const attempt = async () => {
+      const row = await Db.updatePlayer(dbId, { name: cleanName, role, team: cleanTeam, price: cleanPrice });
       setPlayerDB((prev) => prev.map((p) => (p.dbId === dbId ? dbRowToPlayer(row) : p)));
-      return true;
-    } catch (e) {
+    };
+    attempt().catch((e) => {
       if (e.code === "23505") {
         window.alert(`${cleanName} (${role}) è già nel listone.`);
-      } else {
-        setSaveError(true);
+        return;
       }
-      return false;
-    }
+      queueRetry(attempt, dbId);
+    });
+    return true;
   };
 
-  const deleteManualPlayer = async (dbId) => {
+  const deleteManualPlayer = (dbId) => {
     setPlayerDB((prev) => prev.filter((p) => p.dbId !== dbId));
-    try {
-      await Db.deletePlayer(dbId);
-    } catch (e) {
-      setSaveError(true);
+    if (String(dbId).startsWith("pending-")) {
+      cancelPending(dbId);
+      return;
     }
+    const attempt = () => Db.deletePlayer(dbId);
+    attempt().catch(() => queueRetry(attempt, dbId));
   };
 
   const pickFromListone = (p) => {
@@ -1104,7 +1220,7 @@ function AstaFantacalcio() {
     <div style={{ background: BG }} className="min-h-screen pb-24">
       <style>{FONT_IMPORT}</style>
 
-      <Header totals={totals} saveError={saveError} />
+      <Header totals={totals} saveError={saveError} offline={offline} pendingCount={pendingCount} />
 
       <div className="sticky top-0 z-20 relative" style={{ background: BG }}>
         <nav className="flex gap-1 px-3 pt-2 pb-2 overflow-x-auto">
@@ -1208,7 +1324,15 @@ function AstaFantacalcio() {
 
 /* ---------- sub-components ---------- */
 
-function Header({ totals, saveError }) {
+function Header({ totals, saveError, offline, pendingCount }) {
+  let status = null;
+  if (offline) {
+    status = pendingCount > 0 ? `offline · ${pendingCount} in attesa` : "offline";
+  } else if (pendingCount > 0) {
+    status = `sincronizzo… (${pendingCount})`;
+  } else if (saveError) {
+    status = "salvataggio non riuscito";
+  }
   return (
     <div className="px-4 pt-5 pb-3" style={{ borderBottom: "1px solid rgba(243,239,228,0.12)" }}>
       <div className="flex items-baseline justify-between">
@@ -1218,7 +1342,11 @@ function Header({ totals, saveError }) {
         >
           Asta Fantacalcio
         </h1>
-        {saveError && <span className="text-xs" style={{ color: DANGER }}>salvataggio non riuscito</span>}
+        {status && (
+          <span className="text-xs" style={{ color: offline || pendingCount > 0 ? GOLD : DANGER }}>
+            {status}
+          </span>
+        )}
       </div>
       <div className="mt-3 grid grid-cols-3 gap-2">
         <Stat label="Speso" value={totals.spent} accent={GOLD} />
