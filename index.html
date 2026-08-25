@@ -133,7 +133,7 @@ const Db = {
   async replacePlayers(auctionId, players) {
     const { error: delErr } = await sb.from("players").delete().eq("auction_id", auctionId);
     if (delErr) throw delErr;
-    if (!players.length) return;
+    if (!players.length) return [];
     const rows = players.map((p) => ({
       auction_id: auctionId,
       name: p.name,
@@ -141,10 +141,41 @@ const Db = {
       team: p.team || null,
       price: p.price,
     }));
-    const { error: insErr } = await sb.from("players").insert(rows);
+    const { data, error: insErr } = await sb.from("players").insert(rows).select();
     if (insErr) throw insErr;
+    return data;
+  },
+
+  async insertPlayer(auctionId, { name, role, team, price }) {
+    const { data, error } = await sb
+      .from("players")
+      .insert({ auction_id: auctionId, name, role, team: team || null, price })
+      .select()
+      .single();
+    if (error) throw error;
+    return data;
+  },
+
+  async updatePlayer(dbId, { name, role, team, price }) {
+    const { data, error } = await sb
+      .from("players")
+      .update({ name, role, team: team || null, price })
+      .eq("id", dbId)
+      .select()
+      .single();
+    if (error) throw error;
+    return data;
+  },
+
+  async deletePlayer(dbId) {
+    const { error } = await sb.from("players").delete().eq("id", dbId);
+    if (error) throw error;
   },
 };
+
+function dbRowToPlayer(p) {
+  return { id: p.id, dbId: p.id, name: p.name, role: p.role, team: p.team || "", price: p.price };
+}
 
 function assembleTeams(teamRows, assignmentRows) {
   const byTeamDbId = new Map(teamRows.map((t) => [t.id, []]));
@@ -756,6 +787,7 @@ function AstaFantacalcio() {
   const [view, setView] = useState("board"); // board | quick | listone | log | setup
   const [expandedTeam, setExpandedTeam] = useState(null);
   const [form, setForm] = useState({ name: "", role: "D", teamId: 0, price: "" });
+  const [draftNames, setDraftNames] = useState({});
   const [confirmClear, setConfirmClear] = useState(false);
   const [quickCallOpen, setQuickCallOpen] = useState(false);
   const [quickCallInitial, setQuickCallInitial] = useState(null);
@@ -792,18 +824,10 @@ function AstaFantacalcio() {
 
         const playerRows = await Db.loadPlayers(auction.id);
         if (playerRows.length) {
-          setPlayerDB(
-            playerRows.map((p) => ({
-              id: `${p.name}-${p.role}-${p.team || ""}`.toLowerCase(),
-              name: p.name,
-              role: p.role,
-              team: p.team || "",
-              price: p.price,
-            }))
-          );
+          setPlayerDB(playerRows.map(dbRowToPlayer));
         } else {
-          setPlayerDB(DEFAULT_PLAYERS);
-          await Db.replacePlayers(auction.id, DEFAULT_PLAYERS);
+          const inserted = await Db.replacePlayers(auction.id, DEFAULT_PLAYERS);
+          setPlayerDB(inserted.map(dbRowToPlayer));
         }
         setSaveError(false);
       } catch (e) {
@@ -934,13 +958,25 @@ function AstaFantacalcio() {
   };
 
   const renameTeam = (teamId, name) => {
-    setTeams((prev) => prev.map((t) => (t.id === teamId ? { ...t, name } : t)));
+    setDraftNames((prev) => ({ ...prev, [teamId]: name }));
     const existing = renameTimersRef.current.get(teamId);
     if (existing) clearTimeout(existing);
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       renameTimersRef.current.delete(teamId);
       const dbId = teamDbIdRef.current.get(teamId);
-      if (dbId) Db.renameTeam(dbId, name).catch(() => setSaveError(true));
+      if (dbId) {
+        try {
+          await Db.renameTeam(dbId, name);
+          setTeams((prev) => prev.map((t) => (t.id === teamId ? { ...t, name } : t)));
+        } catch (e) {
+          setSaveError(true);
+        }
+      }
+      setDraftNames((prev) => {
+        const next = { ...prev };
+        delete next[teamId];
+        return next;
+      });
     }, 500);
     renameTimersRef.current.set(teamId, timer);
   };
@@ -966,16 +1002,28 @@ function AstaFantacalcio() {
       setImportMsg("Nessun giocatore riconosciuto. Controlla il formato.");
       return;
     }
-    setPlayerDB(parsed);
-    Db.replacePlayers(auctionId, parsed).catch(() => setSaveError(true));
-    setImportText("");
-    setImportMsg(`Importati ${parsed.length} giocatori.`);
+    (async () => {
+      try {
+        const inserted = await Db.replacePlayers(auctionId, parsed);
+        setPlayerDB(inserted.map(dbRowToPlayer));
+        setImportText("");
+        setImportMsg(`Importati ${parsed.length} giocatori.`);
+      } catch (e) {
+        setSaveError(true);
+      }
+    })();
   };
 
   const resetDB = () => {
-    setPlayerDB(DEFAULT_PLAYERS);
-    Db.replacePlayers(auctionId, DEFAULT_PLAYERS).catch(() => setSaveError(true));
-    setImportMsg(`Listone ripristinato (${DEFAULT_PLAYERS.length} giocatori).`);
+    (async () => {
+      try {
+        const inserted = await Db.replacePlayers(auctionId, DEFAULT_PLAYERS);
+        setPlayerDB(inserted.map(dbRowToPlayer));
+        setImportMsg(`Listone ripristinato (${DEFAULT_PLAYERS.length} giocatori).`);
+      } catch (e) {
+        setSaveError(true);
+      }
+    })();
   };
 
   const clearDB = async () => {
@@ -983,6 +1031,57 @@ function AstaFantacalcio() {
     setImportMsg("Listone svuotato.");
     try {
       await Db.replacePlayers(auctionId, []);
+    } catch (e) {
+      setSaveError(true);
+    }
+  };
+
+  const addManualPlayer = async ({ name, role, team, price }) => {
+    const cleanName = (name || "").trim();
+    const cleanPrice = parseInt(price, 10);
+    if (!cleanName || !ROLE_KEYS.includes(role) || isNaN(cleanPrice) || cleanPrice < 0) {
+      window.alert("Compila nome, ruolo e prezzo (numero ≥ 0) prima di salvare.");
+      return false;
+    }
+    try {
+      const row = await Db.insertPlayer(auctionId, { name: cleanName, role, team: (team || "").trim(), price: cleanPrice });
+      setPlayerDB((prev) => [...prev, dbRowToPlayer(row)]);
+      return true;
+    } catch (e) {
+      if (e.code === "23505") {
+        window.alert(`${cleanName} (${role}) è già nel listone.`);
+      } else {
+        setSaveError(true);
+      }
+      return false;
+    }
+  };
+
+  const editManualPlayer = async (dbId, { name, role, team, price }) => {
+    const cleanName = (name || "").trim();
+    const cleanPrice = parseInt(price, 10);
+    if (!cleanName || !ROLE_KEYS.includes(role) || isNaN(cleanPrice) || cleanPrice < 0) {
+      window.alert("Compila nome, ruolo e prezzo (numero ≥ 0) prima di salvare.");
+      return false;
+    }
+    try {
+      const row = await Db.updatePlayer(dbId, { name: cleanName, role, team: (team || "").trim(), price: cleanPrice });
+      setPlayerDB((prev) => prev.map((p) => (p.dbId === dbId ? dbRowToPlayer(row) : p)));
+      return true;
+    } catch (e) {
+      if (e.code === "23505") {
+        window.alert(`${cleanName} (${role}) è già nel listone.`);
+      } else {
+        setSaveError(true);
+      }
+      return false;
+    }
+  };
+
+  const deleteManualPlayer = async (dbId) => {
+    setPlayerDB((prev) => prev.filter((p) => p.dbId !== dbId));
+    try {
+      await Db.deletePlayer(dbId);
     } catch (e) {
       setSaveError(true);
     }
@@ -1046,7 +1145,14 @@ function AstaFantacalcio() {
       {view === "log" && <LogView log={allLog} removePlayer={removePlayer} />}
 
       {view === "listone" && (
-        <ListoneView playerDB={playerDB} soldMap={soldMap} onPick={pickFromListone} />
+        <ListoneView
+          playerDB={playerDB}
+          soldMap={soldMap}
+          onPick={pickFromListone}
+          addManualPlayer={addManualPlayer}
+          editManualPlayer={editManualPlayer}
+          deleteManualPlayer={deleteManualPlayer}
+        />
       )}
 
       {view === "setup" && (
@@ -1428,12 +1534,13 @@ function LogView({ log, removePlayer }) {
   );
 }
 
-function ListoneView({ playerDB, soldMap, onPick }) {
+function ListoneView({ playerDB, soldMap, onPick, addManualPlayer, editManualPlayer, deleteManualPlayer }) {
   const [search, setSearch] = useState("");
   const [roleFilter, setRoleFilter] = useState("ALL");
   const [teamFilter, setTeamFilter] = useState("ALL");
   const [onlyAvailable, setOnlyAvailable] = useState(true);
   const [limit, setLimit] = useState(60);
+  const [editTarget, setEditTarget] = useState(null); // null=chiuso, {}=nuovo, player=modifica
 
   const teamOptions = useMemo(() => {
     const set = new Set(playerDB.map((p) => p.team).filter(Boolean));
@@ -1458,25 +1565,32 @@ function ListoneView({ playerDB, soldMap, onPick }) {
     setLimit(60);
   }, [search, roleFilter, teamFilter, onlyAvailable]);
 
-  if (playerDB.length === 0) {
-    return (
-      <div className="px-4 py-10 text-center" style={{ color: "rgba(243,239,228,0.5)" }}>
-        Nessun listone caricato. Vai in Impostazioni → "Carica listone" per importare i giocatori.
-      </div>
-    );
-  }
-
   const visible = filtered.slice(0, limit);
 
   return (
     <div className="px-3 mt-1 flex flex-col gap-2 pb-4">
-      <input
-        placeholder="Cerca giocatore…"
-        value={search}
-        onChange={(e) => setSearch(e.target.value)}
-        className="w-full rounded-lg px-3 py-2 text-sm"
-        style={{ background: CARD_BG, color: CREAM, border: "1px solid rgba(243,239,228,0.14)" }}
-      />
+      <div className="flex gap-2">
+        <input
+          placeholder="Cerca giocatore…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          className="flex-1 rounded-lg px-3 py-2 text-sm"
+          style={{ background: CARD_BG, color: CREAM, border: "1px solid rgba(243,239,228,0.14)" }}
+        />
+        <button
+          onClick={() => setEditTarget({})}
+          className="rounded-lg px-3 py-2 text-sm font-bold shrink-0"
+          style={{ background: GOLD, color: BG }}
+        >
+          + Giocatore
+        </button>
+      </div>
+
+      {playerDB.length === 0 && (
+        <div className="px-2 py-6 text-center text-sm" style={{ color: "rgba(243,239,228,0.5)" }}>
+          Nessun listone caricato. Aggiungi un giocatore qui sopra oppure vai in Impostazioni → "Carica listone".
+        </div>
+      )}
 
       <div className="flex gap-1.5 overflow-x-auto">
         {[["ALL", "Tutti"], ...ROLES.map((r) => [r.key, r.label])].map(([key, label]) => (
@@ -1528,14 +1642,16 @@ function ListoneView({ playerDB, soldMap, onPick }) {
         {visible.map((p) => {
           const sold = soldMap.get(`${p.name.toLowerCase()}|${p.role}`);
           return (
-            <button
+            <div
               key={p.id}
-              onClick={() => !sold && onPick(p)}
-              disabled={!!sold}
-              className="flex items-center justify-between rounded-lg px-3 py-2 text-left"
+              className="flex items-center justify-between rounded-lg pl-3 pr-1.5 py-1.5 gap-1"
               style={{ background: CARD_BG, opacity: sold ? 0.45 : 1 }}
             >
-              <div className="flex items-center gap-2 min-w-0">
+              <button
+                onClick={() => !sold && onPick(p)}
+                disabled={!!sold}
+                className="flex items-center gap-2 min-w-0 flex-1 text-left py-0.5"
+              >
                 <span
                   className="text-[10px] font-bold w-5 h-5 flex items-center justify-center rounded shrink-0"
                   style={{ background: roleColor(p.role) + "26", color: roleColor(p.role) }}
@@ -1550,11 +1666,19 @@ function ListoneView({ playerDB, soldMap, onPick }) {
                     {sold ? `venduto a ${sold.teamName} · ${sold.price}cr` : p.team}
                   </div>
                 </div>
-              </div>
-              <span className="text-sm font-semibold tabular-nums shrink-0 ml-2" style={{ color: GOLD, fontFamily: MONO_FONT }}>
+              </button>
+              <span className="text-sm font-semibold tabular-nums shrink-0" style={{ color: GOLD, fontFamily: MONO_FONT }}>
                 {p.price ?? "—"}
               </span>
-            </button>
+              <button
+                onClick={() => setEditTarget(p)}
+                className="text-xs px-2 py-1.5 shrink-0"
+                style={{ color: "rgba(243,239,228,0.5)" }}
+                aria-label={`Modifica ${p.name}`}
+              >
+                ✎
+              </button>
+            </div>
           );
         })}
       </div>
@@ -1568,6 +1692,154 @@ function ListoneView({ playerDB, soldMap, onPick }) {
           Mostra altri ({filtered.length - visible.length})
         </button>
       )}
+
+      {editTarget && (
+        <PlayerEditModal
+          player={editTarget.dbId ? editTarget : null}
+          addManualPlayer={addManualPlayer}
+          editManualPlayer={editManualPlayer}
+          deleteManualPlayer={deleteManualPlayer}
+          onClose={() => setEditTarget(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function PlayerEditModal({ player, addManualPlayer, editManualPlayer, deleteManualPlayer, onClose }) {
+  const isNew = !player;
+  const [name, setName] = useState(player?.name || "");
+  const [role, setRole] = useState(player?.role || "D");
+  const [team, setTeam] = useState(player?.team || "");
+  const [price, setPrice] = useState(player?.price != null ? String(player.price) : "");
+  const [saving, setSaving] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  const submit = async () => {
+    setSaving(true);
+    const ok = isNew
+      ? await addManualPlayer({ name, role, team, price })
+      : await editManualPlayer(player.dbId, { name, role, team, price });
+    setSaving(false);
+    if (ok) onClose();
+  };
+
+  const doDelete = async () => {
+    await deleteManualPlayer(player.dbId);
+    onClose();
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-40 flex items-end justify-center"
+      style={{ background: "rgba(0,0,0,0.55)" }}
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-md rounded-t-2xl px-4 pt-4 pb-6 flex flex-col gap-3"
+        style={{ background: CARD_BG, maxHeight: "92vh", overflowY: "auto" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between">
+          <div className="font-bold text-lg" style={{ color: CREAM, fontFamily: DISPLAY_FONT }}>
+            {isNew ? "Nuovo giocatore" : "Modifica giocatore"}
+          </div>
+          <button onClick={onClose} className="text-sm px-2 py-1" style={{ color: "rgba(243,239,228,0.6)" }}>
+            Chiudi
+          </button>
+        </div>
+
+        <input
+          autoFocus
+          placeholder="Nome giocatore"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          className="w-full rounded-lg px-3 py-2.5 text-sm"
+          style={{ background: "rgba(243,239,228,0.07)", color: CREAM, border: "1px solid rgba(243,239,228,0.14)" }}
+        />
+
+        <div className="flex gap-1.5">
+          {ROLES.map((r) => (
+            <button
+              key={r.key}
+              onClick={() => setRole(r.key)}
+              className="flex-1 py-2 rounded-lg text-xs font-bold"
+              style={{
+                background: role === r.key ? r.color : "rgba(243,239,228,0.08)",
+                color: role === r.key ? BG : CREAM,
+              }}
+            >
+              {r.key}
+            </button>
+          ))}
+        </div>
+
+        <input
+          placeholder="Squadra (facoltativa)"
+          value={team}
+          onChange={(e) => setTeam(e.target.value)}
+          className="w-full rounded-lg px-3 py-2.5 text-sm"
+          style={{ background: "rgba(243,239,228,0.07)", color: CREAM, border: "1px solid rgba(243,239,228,0.14)" }}
+        />
+
+        <input
+          type="number"
+          inputMode="numeric"
+          placeholder="Quotazione crediti"
+          value={price}
+          onChange={(e) => setPrice(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          className="w-full rounded-lg px-3 py-2.5 text-lg font-bold tabular-nums"
+          style={{
+            background: "rgba(243,239,228,0.07)",
+            color: GOLD,
+            fontFamily: MONO_FONT,
+            border: "1px solid rgba(243,239,228,0.14)",
+          }}
+        />
+
+        <button
+          onClick={submit}
+          disabled={saving || !name.trim() || price === ""}
+          className="w-full rounded-xl py-3 font-bold"
+          style={{
+            background: saving || !name.trim() || price === "" ? "rgba(243,239,228,0.15)" : GOLD,
+            color: saving || !name.trim() || price === "" ? "rgba(243,239,228,0.4)" : BG,
+            fontFamily: DISPLAY_FONT,
+          }}
+        >
+          {isNew ? "Aggiungi al listone" : "Salva modifiche"}
+        </button>
+
+        {!isNew && (
+          confirmDelete ? (
+            <div className="flex gap-2">
+              <button
+                onClick={doDelete}
+                className="flex-1 rounded-lg py-2 text-sm font-semibold"
+                style={{ background: DANGER, color: CREAM }}
+              >
+                Conferma rimozione
+              </button>
+              <button
+                onClick={() => setConfirmDelete(false)}
+                className="rounded-lg px-3 py-2 text-sm font-semibold"
+                style={{ background: "rgba(243,239,228,0.08)", color: CREAM }}
+              >
+                Annulla
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => setConfirmDelete(true)}
+              className="w-full rounded-lg py-2 text-sm font-semibold"
+              style={{ background: "rgba(224,108,92,0.15)", color: DANGER }}
+            >
+              Rimuovi dal listone
+            </button>
+          )
+        )}
+      </div>
     </div>
   );
 }
@@ -1804,7 +2076,7 @@ function SetupView({
           {teams.map((t) => (
             <input
               key={t.id}
-              value={t.name}
+              value={draftNames[t.id] !== undefined ? draftNames[t.id] : t.name}
               onChange={(e) => renameTeam(t.id, e.target.value)}
               className="w-full rounded-lg px-3 py-2 text-sm"
               style={inputStyle}
